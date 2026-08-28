@@ -166,6 +166,136 @@ const THEMES: Record<string, ThemeDef> = {
   custom:  { name: 'Custom',          bg: '#171a20', panel: '#1d212a', pane: '#12151b', paneAlt: '#0d1017', border: '#2a3140', borderSoft: '#222838', text: '#e8ebf0', muted: '#8890a0', dim: '#5c6370', accent: '#f2a65a', accent2: '#7fb2f0' },
 };
 let currentTheme = 'aurora';
+function splitPaneId(td: TabData, paneId: number, dir: 'row' | 'col'): void {
+  const holder: { newId: number | null } = { newId: null };
+  td.root = insertSplit(td.root, paneId, dir, holder);
+  if (holder.newId) td.focused = holder.newId;
+  renderPanes();
+}
+
+function closePane(td: TabData, paneId: number): void {
+  if (countLeaves(td.root) <= 1) { confirmCloseSession(activeSession!); return; }
+  const leaf = findLeaf(td.root, paneId);
+  if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.tabEl?.remove(); leaf.session.dispose(); }
+  td.root = removeLeaf(td.root, paneId)!;
+  if (td.focused === paneId) td.focused = firstLeafId(td.root);
+  renderPanes();
+}
+
+function setSingleLayout(td: TabData): void {
+  // Kill all sessions except focused
+  const focusedId = td.focused;
+  const killIds: number[] = [];
+  const collectIds = (node: SplitTree): void => {
+    if (node.type === 'leaf') { if ((node as SplitLeaf).id !== focusedId) killIds.push((node as SplitLeaf).id); }
+    else { for (const c of (node as SplitNode).children) collectIds(c); }
+  };
+  collectIds(td.root);
+  for (const id of killIds) {
+    const leaf = findLeaf(td.root, id);
+    if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.tabEl?.remove(); leaf.session.dispose(); }
+  }
+  const focusedLeaf = findLeaf(td.root, focusedId);
+  td.root = { type: 'leaf', id: focusedId, session: focusedLeaf?.session ?? null };
+  renderPanes();
+}
+
+function setGridLayout(td: TabData): void {
+  // Kill existing sessions (keep active)
+  const existingSessions = new Map<number, Session>();
+  const collectAll = (node: SplitTree): void => {
+    if (node.type === 'leaf') { const l = node as SplitLeaf; if (l.session) existingSessions.set(l.id, l.session); }
+    else { for (const c of (node as SplitNode).children) collectAll(c); }
+  };
+  collectAll(td.root);
+  const ids = [paneSeq++, paneSeq++, paneSeq++, paneSeq++];
+  td.root = {
+    type: 'split', dir: 'col', ratio: [0.5, 0.5], children: [
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[0], session: null }, { type: 'leaf', id: ids[1], session: null }] },
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[2], session: null }, { type: 'leaf', id: ids[3], session: null }] },
+    ],
+  };
+  // Reuse existing session for first pane, kill the rest
+  if (activeSession) {
+    const firstLeaf = findLeaf(td.root, ids[0]);
+    if (firstLeaf) firstLeaf.session = activeSession;
+    for (const [, s] of existingSessions) {
+      if (s !== activeSession) { s.kill(); sessions.splice(sessions.indexOf(s), 1); s.tabEl?.remove(); s.dispose(); }
+    }
+  }
+  td.focused = ids[0];
+  renderPanes();
+}
+
+function clearFocusedPane(td: TabData): void {
+  const leaf = findLeaf(td.root, td.focused);
+  if (leaf) leaf.cleared = true;
+  renderPanes();
+  showToast('Panel cleared');
+}
+
+// ---------------------------------------------------------------------------
+// Tree rendering (builds DOM from split-tree)
+// ---------------------------------------------------------------------------
+const mql = window.matchMedia('(max-width: 700px)');
+function effectiveDir(dir: string): string { return mql.matches ? 'col' : dir; }
+
+function renderTree(node: SplitTree, td: TabData): HTMLElement {
+  if (node.type === 'leaf') {
+    const leaf = node as SplitLeaf;
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'flex:1;min-width:0;min-height:0;display:flex;';
+    if (!leaf.session) {
+      // Create a new session for this pane
+      const name = nextSessionName();
+      leaf.session = addSession(name, false);
+    }
+    const s = leaf.session;
+    s.attachTo(wrapper, leaf.id);
+    s.setActive(leaf.id === td.focused);
+    // Store paneId on the paneEl for split/close button handlers
+    wrapper.addEventListener('click', () => {
+      if (td.focused !== leaf.id) { td.focused = leaf.id; renderPanes(); }
+    });
+    return wrapper;
+  }
+  const sn = node as SplitNode;
+  const dir = effectiveDir(sn.dir);
+  const wrap = document.createElement('div');
+  wrap.className = 'split-container ' + (dir === 'row' ? 'split-row' : 'split-col');
+  const childWraps = sn.children.map((child, i) => {
+    const cw = document.createElement('div');
+    cw.className = 'split-child';
+    cw.style.flexBasis = (sn.ratio[i] * 100) + '%';
+    cw.appendChild(renderTree(child, td));
+    return cw;
+  });
+  childWraps.forEach((cw, i) => {
+    wrap.appendChild(cw);
+    if (i < childWraps.length - 1) {
+      const divider = document.createElement('div');
+      divider.className = 'divider ' + (dir === 'row' ? 'divider-row' : 'divider-col');
+      attachDividerDrag(divider, sn, i, dir, wrap, childWraps[i], childWraps[i + 1]);
+      wrap.appendChild(divider);
+    }
+  });
+  return wrap;
+}
+
+function renderPanes(): void {
+  const td = activeTabData();
+  if (!td) return;
+  paneGrid.innerHTML = '';
+  paneGrid.appendChild(renderTree(td.root, td));
+  updateLayoutLabel();
+}
+
+function updateLayoutLabel(): void {
+  const td = activeTabData();
+  if (!td) return;
+  const n = countLeaves(td.root);
+  layoutLabel.textContent = n === 1 ? '1 panel' : n + ' panels';
+}
 
 function pushCssVars(t: ThemeDef): void {
   const r = document.documentElement.style;
@@ -204,6 +334,106 @@ const XTERM_THEME: Record<string, string> = {
 // ---------------------------------------------------------------------------
 const root = document.documentElement;
 const paneGrid = document.getElementById('paneGrid')!;
+
+// ---------------------------------------------------------------------------
+// Split-tree pane system
+// ---------------------------------------------------------------------------
+interface SplitLeaf {
+  type: 'leaf';
+  id: number;
+  session: Session | null;
+  cleared?: boolean;
+}
+interface SplitNode {
+  type: 'split';
+  dir: 'row' | 'col';
+  ratio: number[];
+  children: (SplitLeaf | SplitNode)[];
+}
+type SplitTree = SplitLeaf | SplitNode;
+
+interface TabData {
+  id: number;
+  title: string;
+  root: SplitTree;
+  focused: number; // pane id
+}
+
+let paneSeq = 30;
+const tabDataList: TabData[] = [];
+let activeTabId = 1;
+
+function activeTabData(): TabData | undefined { return tabDataList.find((t) => t.id === activeTabId); }
+
+function countLeaves(node: SplitTree): number { return node.type === 'leaf' ? 1 : (node as SplitNode).children.reduce((s, c) => s + countLeaves(c), 0); }
+function firstLeafId(node: SplitTree): number { return node.type === 'leaf' ? (node as SplitLeaf).id : firstLeafId((node as SplitNode).children[0]); }
+function findLeaf(node: SplitTree, id: number): SplitLeaf | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).id === id ? node as SplitLeaf : null;
+  for (const c of (node as SplitNode).children) { const r = findLeaf(c, id); if (r) return r; }
+  return null;
+}
+function insertSplit(node: SplitTree, id: number, dir: 'row' | 'col', holder: { newId: number | null }): SplitTree {
+  if (node.type === 'leaf') {
+    if ((node as SplitLeaf).id === id) {
+      const newId = paneSeq++;
+      holder.newId = newId;
+      return { type: 'split', dir, ratio: [0.5, 0.5], children: [{ type: 'leaf', id: (node as SplitLeaf).id, session: (node as SplitLeaf).session }, { type: 'leaf', id: newId, session: null }] };
+    }
+    return node;
+  }
+  return { ...(node as SplitNode), children: (node as SplitNode).children.map((c) => insertSplit(c, id, dir, holder)) };
+}
+function removeLeaf(node: SplitTree, id: number): SplitTree | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).id === id ? null : node;
+  const sn = node as SplitNode;
+  const newChildren: SplitTree[] = [];
+  const newRatio: number[] = [];
+  sn.children.forEach((c, i) => {
+    const res = removeLeaf(c, id);
+    if (res !== null) { newChildren.push(res); newRatio.push(sn.ratio[i]); }
+  });
+  if (newChildren.length === 0) return null;
+  if (newChildren.length === 1) return newChildren[0];
+  const sum = newRatio.reduce((a, b) => a + b, 0) || 1;
+  return { type: 'split', dir: sn.dir, children: newChildren, ratio: newRatio.map((r) => r / sum) };
+}
+
+function clamp(v: number, min: number, max: number): number { return Math.min(max, Math.max(min, v)); }
+
+// ---------------------------------------------------------------------------
+// Divider drag-to-resize
+// ---------------------------------------------------------------------------
+function attachDividerDrag(divider: HTMLElement, node: SplitNode, i: number, dir: string, containerEl: HTMLElement, leftEl: HTMLElement, rightEl: HTMLElement): void {
+  divider.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { divider.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    divider.classList.add('active');
+    document.body.style.userSelect = 'none';
+    const rect = containerEl.getBoundingClientRect();
+    const total = dir === 'row' ? rect.width : rect.height;
+    const startPos = dir === 'row' ? e.clientX : e.clientY;
+    const baseA = node.ratio[i], baseB = node.ratio[i + 1];
+    const pairTotal = baseA + baseB;
+    let pendingA: number | null = null, pendingB: number | null = null;
+    const onMove = (ev: PointerEvent) => {
+      const pos = dir === 'row' ? ev.clientX : ev.clientY;
+      const delta = (pos - startPos) / total;
+      let newA = clamp(baseA + delta, pairTotal * 0.15, pairTotal * 0.85);
+      let newB = pairTotal - newA;
+      leftEl.style.flexBasis = (newA * 100) + '%';
+      rightEl.style.flexBasis = (newB * 100) + '%';
+      pendingA = newA; pendingB = newB;
+    };
+    const onUp = () => {
+      if (pendingA !== null) { node.ratio[i] = pendingA; node.ratio[i + 1] = pendingB!; }
+      divider.classList.remove('active');
+      document.body.style.userSelect = '';
+      divider.removeEventListener('pointermove', onMove);
+    };
+    divider.addEventListener('pointermove', onMove);
+    divider.addEventListener('pointerup', onUp, { once: true });
+  });
+}
 const keybarEl = document.getElementById('keybar')!;
 const statusEl = document.getElementById('status');
 const tabsEl = document.getElementById('tabs')!;
@@ -314,24 +544,29 @@ class Session {
     this.panePath.textContent = `◦ zsh — ${this.displayName}`;
     const paneActions = document.createElement('div');
     paneActions.className = 'pane-actions';
-    // Split / close buttons (visual for now; real splitting deferred)
-    const splitR = document.createElement('button');
-    splitR.className = 'mini-btn'; splitR.title = 'Split right'; splitR.textContent = '⬒';
-    splitR.addEventListener('click', (e) => { e.stopPropagation(); showToast('Split right — coming soon'); });
-    const splitB = document.createElement('button');
-    splitB.className = 'mini-btn'; splitB.title = 'Split bottom'; splitB.textContent = '⬓';
-    splitB.addEventListener('click', (e) => { e.stopPropagation(); showToast('Split bottom — coming soon'); });
-    const closePane = document.createElement('button');
-    closePane.className = 'mini-btn danger'; closePane.title = 'Close panel'; closePane.textContent = '✕';
-    closePane.addEventListener('click', (e) => { e.stopPropagation(); confirmCloseSession(this); });
-    paneActions.append(splitR, splitB, closePane);
+    paneActions.innerHTML = `
+      <button class="mini-btn" data-act="split-row" title="Split right" aria-label="Split right">⬒</button>
+      <button class="mini-btn" data-act="split-col" title="Split bottom" aria-label="Split bottom">⬓</button>
+      <button class="mini-btn danger" data-act="close" title="Close panel" aria-label="Close panel">✕</button>`;
+    paneActions.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const act = (e.target as HTMLElement).closest('.mini-btn')?.getAttribute('data-act');
+      if (!act) return;
+      const td = activeTabData();
+      if (!td) return;
+      const paneId = (this.paneEl as unknown as { _paneId?: number })._paneId;
+      if (paneId === undefined) return;
+      if (act === 'split-row') { splitPaneId(td, paneId, 'row'); showToast('Split right'); }
+      if (act === 'split-col') { splitPaneId(td, paneId, 'col'); showToast('Split bottom'); }
+      if (act === 'close') { closePane(td, paneId); }
+    });
     this.paneHead.append(this.panePath, paneActions);
 
     this.el = document.createElement('div');
     this.el.className = 'pane-body hidden';
 
     this.paneEl.append(this.paneHead, this.el);
-    paneGrid.append(this.paneEl);
+    // NOTE: paneEl is NOT appended to paneGrid here; tree rendering places it
 
     this.term.open(this.el);
     if (WEBGL_ENABLED) {
@@ -514,6 +749,14 @@ class Session {
         this.fit();
         if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
       });
+    }
+  }
+
+  /** Attach pane to a DOM container (called by tree rendering) */
+  attachTo(container: HTMLElement, paneId: number): void {
+    if (this.paneEl) {
+      (this.paneEl as unknown as { _paneId?: number })._paneId = paneId;
+      container.append(this.paneEl);
     }
   }
 
@@ -805,6 +1048,10 @@ function closeSession(s: Session): void {
   sessions.splice(idx, 1);
   s.tabEl?.remove();
   s.dispose();
+  // Remove from any split-tree leaf
+  for (const td of tabDataList) {
+    removeSessionFromTree(td.root, s);
+  }
   if (activeSession === s) {
     activeSession = null;
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
@@ -814,6 +1061,11 @@ function closeSession(s: Session): void {
   refreshMobileUI();
   updateStatusBar();
   saveTabs();
+}
+
+function removeSessionFromTree(node: SplitTree, s: Session): void {
+  if (node.type === 'leaf') { if ((node as SplitLeaf).session === s) (node as SplitLeaf).session = null; }
+  else { for (const c of (node as SplitNode).children) removeSessionFromTree(c, s); }
 }
 
 function nextSessionName(): string {
@@ -1037,11 +1289,11 @@ function updateStatusBar(): void {
 // ---------------------------------------------------------------------------
 // Toolbar buttons (reference design)
 // ---------------------------------------------------------------------------
-// Layout buttons (visual only for now)
-document.getElementById('layoutSingle')?.addEventListener('click', () => { showToast('Single layout'); });
-document.getElementById('layoutV')?.addEventListener('click', () => { showToast('Split right — coming soon'); });
-document.getElementById('layoutH')?.addEventListener('click', () => { showToast('Split bottom — coming soon'); });
-document.getElementById('layoutGrid')?.addEventListener('click', () => { showToast('Grid 2x2 — coming soon'); });
+// Layout buttons (real split actions)
+document.getElementById('layoutSingle')?.addEventListener('click', () => { const td = activeTabData(); if (td) { setSingleLayout(td); showToast('Single layout'); } });
+document.getElementById('layoutV')?.addEventListener('click', () => { const td = activeTabData(); if (td) { splitPaneId(td, td.focused, 'row'); showToast('Split right'); } });
+document.getElementById('layoutH')?.addEventListener('click', () => { const td = activeTabData(); if (td) { splitPaneId(td, td.focused, 'col'); showToast('Split bottom'); } });
+document.getElementById('layoutGrid')?.addEventListener('click', () => { const td = activeTabData(); if (td) { setGridLayout(td); showToast('Grid 2x2'); } });
 
 // Clear
 document.getElementById('clearBtn')?.addEventListener('click', () => {
@@ -1246,6 +1498,10 @@ function renderDrawer(): void {
       closeTab: ['Close tab', 'Close the active tab'],
       nextTab: ['Next tab', 'Switch to the next tab'],
       prevTab: ['Previous tab', 'Switch to the previous tab'],
+      splitRight: ['Split right', 'Split focused pane vertically'],
+      splitDown: ['Split down', 'Split focused pane horizontally'],
+      singleLayout: ['Single layout', 'Merge to one pane (close others)'],
+      clearPane: ['Clear pane', 'Clear the focused pane content'],
     };
     for (const [action, [label, desc]] of Object.entries(KB_LABELS)) {
       const row = document.createElement('div');
@@ -1263,6 +1519,10 @@ function renderDrawer(): void {
       keybinds.closeTab = 'Ctrl+W';
       keybinds.nextTab = 'Ctrl+Tab';
       keybinds.prevTab = 'Ctrl+Shift+Tab';
+      keybinds.splitRight = 'Ctrl+Shift+→';
+      keybinds.splitDown = 'Ctrl+Shift+↓';
+      keybinds.singleLayout = 'Ctrl+Shift+↑';
+      keybinds.clearPane = 'Ctrl+K';
       renderDrawer();
       showToast('Keybinds reset to defaults');
     });
@@ -1304,6 +1564,10 @@ const keybinds: Record<string, string> = {
   closeTab: 'Ctrl+W',
   nextTab: 'Ctrl+Tab',
   prevTab: 'Ctrl+Shift+Tab',
+  splitRight: 'Ctrl+Shift+→',
+  splitDown: 'Ctrl+Shift+↓',
+  singleLayout: 'Ctrl+Shift+↑',
+  clearPane: 'Ctrl+K',
 };
 
 let recordingBtn: HTMLElement | null = null;
@@ -1360,11 +1624,16 @@ document.addEventListener('keydown', (e) => {
 });
 
 function runAction(action: string): void {
+  const td = activeTabData();
   switch (action) {
     case 'newTab': openNewTabModal(); break;
     case 'closeTab': if (activeSession) confirmCloseSession(activeSession); break;
     case 'nextTab': navigateTab(1); break;
     case 'prevTab': navigateTab(-1); break;
+    case 'splitRight': if (td) { splitPaneId(td, td.focused, 'row'); showToast('Split right'); } break;
+    case 'splitDown': if (td) { splitPaneId(td, td.focused, 'col'); showToast('Split bottom'); } break;
+    case 'singleLayout': if (td) { setSingleLayout(td); showToast('Single layout'); } break;
+    case 'clearPane': if (td) clearFocusedPane(td); break;
   }
 }
 
@@ -1796,9 +2065,12 @@ async function init(): Promise<void> {
   let initialTabs: SavedTab[] = server && server.length ? server : cached.tabs.length ? cached.tabs.slice() : [{ name: defaultSessionName, displayName: defaultSessionName }];
   if (urlSession && !initialTabs.some((t) => t.name === urlSession)) initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
-  for (const t of initialTabs) addSession(t.name, false, t.displayName);
-  const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
-  activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+  // Create initial tab with split-tree
+  const firstSession = addSession(defaultSessionName, true, initialTabs[0]?.displayName);
+  const td: TabData = { id: 1, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1 };
+  tabDataList.push(td);
+  activeTabId = 1;
+  renderPanes();
 }
 
 void init();
