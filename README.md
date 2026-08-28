@@ -15,7 +15,7 @@ on your laptop and keep going from your phone — it's the **same live session**
 </table>
 
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
-Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
+Bun + TypeScript server using [`ws`](https://github.com/websockets/ws) and
 [`node-pty`](https://github.com/microsoft/node-pty) on the back end.
 
 It's designed to live on your **Tailnet**: the server binds to your Tailscale
@@ -45,10 +45,10 @@ an `AUTH_TOKEN` to gate access with a shared token. See [Security](#security).
 
 ```bash
 git clone git@github.com:AaronFei/terminal-web.git && cd terminal-web
-npm install      # needs Node 18+ and tmux (on Linux also: build-essential python3)
-npm run build
+bun install      # needs Bun, tmux (on Linux also: build-essential python3)
+bun run build
 bash scripts/start.sh           # binds your Tailscale IP and prints the URL
-# no Tailscale?  HOST=192.168.1.50 PORT=8090 npm start   (or HOST=0.0.0.0)
+# no Tailscale?  HOST=192.168.1.50 PORT=8090 bun start   (or HOST=0.0.0.0)
 ```
 
 Open the printed `http://<host>:8090/`. Want it always-on (start at boot,
@@ -115,7 +115,7 @@ Development was done on macOS.
 ## Install
 
 ```bash
-npm install
+bun install
 ```
 
 > **Note:** `node-pty` is a native addon. It ships **prebuilt** binaries for
@@ -133,7 +133,7 @@ npm install
 Bundle the client (xterm.js + addons) with esbuild into `public/dist/`:
 
 ```bash
-npm run build
+bun run build
 ```
 
 This produces `public/dist/terminal.js` and `public/dist/terminal.css`
@@ -147,7 +147,7 @@ imports xterm's stylesheet). `public/dist/` is gitignored.
 ### Quick start (recommended)
 
 ```bash
-npm start
+bun start
 # or, with Tailscale auto-detection and an auto-build if needed:
 bash scripts/start.sh
 ```
@@ -174,13 +174,13 @@ tailscale, set `HOST` yourself:
 
 ```bash
 git clone <repo> && cd terminal-web
-npm install
-npm run build
+bun install
+bun run build
 
 # bind to a specific LAN/intranet IP...
-HOST=192.168.1.50 PORT=8090 npm start
+HOST=192.168.1.50 PORT=8090 bun start
 # ...or bind every interface (reachable on all of the host's IPs)
-HOST=0.0.0.0 PORT=8090 npm start
+HOST=0.0.0.0 PORT=8090 bun start
 ```
 
 `scripts/start.sh` and `scripts/service.sh install` also work without tailscale
@@ -195,11 +195,11 @@ HOST=0.0.0.0 PORT=8090 npm start
 ### Development
 
 ```bash
-npm run dev   # -> bash scripts/dev.sh
+bun run dev   # -> bash scripts/dev.sh
 ```
 
-`scripts/dev.sh` runs the esbuild watcher (`node esbuild.mjs --watch`) in the
-background and the server with reload (`tsx watch src/server.ts`) in the
+`scripts/dev.sh` runs the esbuild watcher (`bun esbuild.mjs --watch`) in the
+background and the server with reload (`bun --watch src/server.ts`) in the
 foreground. Editing `web/terminal.ts` rebuilds the bundle; editing server code
 restarts the server. The background watcher is killed automatically when you
 stop the script (Ctrl-C).
@@ -220,7 +220,7 @@ bash scripts/service.sh restart     # after changing server code
 bash scripts/service.sh uninstall   # stop and remove
 ```
 
-`install` pins the node path, the repo path, and `HOST`/`PORT` into the unit.
+`install` pins the bun path, the repo path, and `HOST`/`PORT` into the unit.
 By default `HOST` is your Tailscale IPv4, else `0.0.0.0` (override with
 `HOST=… PORT=… bash scripts/service.sh install`). The service auto-restarts if
 it exits, with a 10 s back-off so it doesn't hot-loop while the network (or
@@ -427,11 +427,11 @@ Treat exposing this as equivalent to handing out SSH access.
 
 ## Troubleshooting
 
-**`node-pty` fails to build / `npm install` errors with node-gyp**
+**`node-pty` fails to build / `bun install` errors with node-gyp**
 `node-pty` is a native addon. Ensure you have a C/C++ toolchain:
 - macOS: `xcode-select --install`
-- Make sure your Node version matches what `node-pty` supports (Node 18+).
-- Try a clean reinstall: `rm -rf node_modules && npm install`.
+- Make sure your Bun version is up to date.
+- Try a clean reinstall: `rm -rf node_modules && bun install`.
 
 **"tmux: command not found" / sessions don't start**
 Install tmux (`brew install tmux`). The server spawns `tmux` per connection
@@ -439,7 +439,7 @@ and loads `tmux/web.tmux.conf`; without tmux on `PATH`, connections fail.
 
 **Port already in use (`EADDRINUSE`)**
 Another process holds the port. Find it with `lsof -i :8090` (adjust the port)
-and stop it, or start with a different port: `PORT=8091 npm start`.
+and stop it, or start with a different port: `PORT=8091 bun start`.
 
 **Tailscale IP not detected / binds to `0.0.0.0`**
 Make sure Tailscale is running and connected: `tailscale status` and
@@ -452,7 +452,7 @@ server logs for the bound URL, verify you're on the tailnet, and confirm the
 port isn't blocked.
 
 **Blank page / terminal doesn't render**
-Make sure the client bundle was built: `npm run build` (or use
+Make sure the client bundle was built: `bun run build` (or use
 `scripts/start.sh`, which builds it automatically). Check the browser console
 for errors loading `/dist/terminal.js`.
 

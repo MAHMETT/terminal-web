@@ -2,7 +2,7 @@
 # Start terminal-web in "production-ish" mode:
 #   - ensure the client bundle is built
 #   - bind the server to the Tailscale IP when available
-#   - launch the server (npm start -> tsx src/server.ts)
+#   - launch the server (bun start -> bun src/server.ts)
 #
 # Usage: bash scripts/start.sh   (or ./scripts/start.sh after chmod +x)
 set -euo pipefail
@@ -14,7 +14,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
 # --- Load optional .env (KEY=VALUE lines) ------------------------------------
-# This script (and scripts/dev.sh) load .env; running `npm start` directly does
+# This script (and scripts/dev.sh) load .env; running `bun start` directly does
 # NOT auto-load it, so export the vars in your shell in that case.
 if [ -f .env ]; then
   set -a
@@ -38,7 +38,7 @@ fi
 # --- Build the client bundle if missing --------------------------------------
 if [ ! -f "public/dist/terminal.js" ]; then
   echo "Client bundle not found (public/dist/terminal.js); building..."
-  npm run build
+  bun run build
 fi
 
 # --- Detect the Tailscale IPv4 and choose HOST/PORT --------------------------
@@ -69,4 +69,4 @@ if [ "${DISPLAY_HOST}" = "0.0.0.0" ]; then
 fi
 
 # --- Run the server ----------------------------------------------------------
-exec npm start
+exec bun start

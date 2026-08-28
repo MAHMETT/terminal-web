@@ -112,7 +112,7 @@ else
 fi
 
 # --- report what is about to ship -------------------------------------------
-# Deploying uncommitted work is allowed — often the point of a test deploy — but
+# Deploying uncommitted work is allowed -- often the point of a test deploy -- but
 # it must never be silent. An unnoticed dirty tree is exactly how a live UI ends
 # up differing from what GitHub shows.
 say "Source: ${REPO_ROOT}"
@@ -124,7 +124,7 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   fi
   dirty="$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')"
   if [ "${dirty}" -gt 0 ]; then
-    echo "    WARNING: ${dirty} tracked file(s) modified but not committed —"
+    echo "    WARNING: ${dirty} tracked file(s) modified but not committed --"
     echo "             what you deploy will NOT match GitHub."
     git status --short --untracked-files=no | sed 's/^/               /'
   fi
@@ -148,24 +148,24 @@ fi
 # keeps the bundle in step with web/ instead of shipping a stale one.
 if [ "${DO_BUILD}" -eq 1 ]; then
   say "Building client bundle"
-  npm run build
+  bun run build
 else
   say "Skipping build (--no-build)"
   [ -f public/dist/terminal.js ] ||
-    die "public/dist/terminal.js missing — drop --no-build for the first deploy"
+    die "public/dist/terminal.js missing -- drop --no-build for the first deploy"
 fi
 
 # --- place the files ---------------------------------------------------------
 case "${MODE}" in
   repo-live)
-    say "No copy needed — the service serves ${REPO_ROOT} directly"
+    say "No copy needed -- the service serves ${REPO_ROOT} directly"
     if [ "${DRY_RUN}" -eq 1 ]; then
       say "Dry run complete; would restart ${UNIT} only"
       exit 0
     fi
     ;;
   none)
-    say "Nothing to deploy to — no service is installed here.
+    say "Nothing to deploy to -- no service is installed here.
     Install one with: bash scripts/service.sh install"
     exit 0
     ;;
@@ -183,7 +183,7 @@ case "${MODE}" in
       --exclude 'scripts/wsl-*.sh'
     )
     if [ "${DRY_RUN}" -eq 1 ]; then
-      say "Dry run — changes that WOULD be made to ${APP}"
+      say "Dry run -- changes that WOULD be made to ${APP}"
       rsync "${RSYNC_ARGS[@]}" --dry-run -i "${REPO_ROOT}/" "${APP}/"
       say "Dry run complete; nothing was changed"
       exit 0
@@ -195,7 +195,7 @@ esac
 
 # --- restart -----------------------------------------------------------------
 if [ "${DO_RESTART}" -eq 0 ]; then
-  say "Skipping restart (--no-restart) — files are updated but the running
+  say "Skipping restart (--no-restart) -- files are updated but the running
     process still holds the old code."
   exit 0
 fi
@@ -204,7 +204,7 @@ say "Restarting"
 case "${RESTART_VIA}" in
   service-sh) bash "${SCRIPT_DIR}/service.sh" restart ;;
   sudo-systemd)
-    echo "    system-wide unit — sudo may prompt for your password"
+    echo "    system-wide unit -- sudo may prompt for your password"
     sudo systemctl restart "${UNIT}"
     ;;
   *) die "no way to restart the service on this machine" ;;

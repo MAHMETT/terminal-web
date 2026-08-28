@@ -1,0 +1,9 @@
+pre-commit:
+  parallel: true
+  commands:
+    lint:
+      glob: "*.{ts,js,mjs,json}"
+      run: bun run lint
+    types:
+      glob: "*.{ts,js,mjs}"
+      run: bunx tsc --noEmit
