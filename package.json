@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "bash scripts/dev.sh",
     "build": "bun esbuild.mjs",
-    "start": "bun src/server.ts",
+    "start": "bun --no-env-file src/server.ts",
     "lint": "oxlint src web",
     "postinstall": "bun scripts/fix-pty-perms.mjs"
   },

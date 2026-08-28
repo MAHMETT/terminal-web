@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
@@ -42,29 +41,6 @@ export interface Config {
 // This file lives at <repoRoot>/src/config.ts, so the repo root is one up.
 const thisDir = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(thisDir, "..");
-
-/**
- * Load .env file from the repo root into process.env.
- * Existing env vars are never overridden (shell/service values take precedence).
- */
-function loadEnvFile(): void {
-  try {
-    const content = readFileSync(path.join(REPO_ROOT, ".env"), "utf8");
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-      const eq = trimmed.indexOf("=");
-      if (eq === -1) continue;
-      const key = trimmed.slice(0, eq).trim();
-      const val = trimmed.slice(eq + 1).trim();
-      if (key && !(key in process.env)) {
-        process.env[key] = val;
-      }
-    }
-  } catch {
-    // .env not found -- not an error, defaults apply.
-  }
-}
 
 /**
  * Detect the first Tailscale IPv4 address via `tailscale ip -4`.
@@ -110,7 +86,6 @@ function parsePort(raw: string | undefined, fallback: number): number {
  * Pure aside from reading process.env and (optionally) probing Tailscale.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
-  loadEnvFile();
   const port = parsePort(env.PORT, 8090);
 
   const tailscaleIp = detectTailscaleIp();
