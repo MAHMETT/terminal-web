@@ -99,7 +99,7 @@ for details.
 These are CLI prerequisites — they are **not** bundled or installed by this
 project:
 
-- **Node.js 18+** (ESM, runs the server via `tsx`)
+- **Bun** (ESM, runs the server directly)
 - **tmux** — the session backend (`brew install tmux` on macOS,
   `sudo apt install tmux` on Debian/Ubuntu)
 - **Linux only:** a C/C++ toolchain + Python 3 to build `node-pty`
@@ -158,9 +158,9 @@ bash scripts/start.sh
 2. Builds the client bundle if `public/dist/terminal.js` is absent.
 3. Detects your Tailscale IPv4 (`tailscale ip -4 | head -1`) and exports it as
    `HOST` (unless `HOST` is already set).
-4. Runs `npm start` and prints the reachable `http://<host>:<port>` URL.
+4. Runs `bun start` and prints the reachable `http://<host>:<port>` URL.
 
-`npm start` alone just runs `tsx src/server.ts`; the server itself also
+`bun start` alone just runs `bun src/server.ts`; the server itself also
 detects the Tailscale IP for `HOST` when `HOST` is unset, and logs the URLs it
 binds (highlighting the Tailscale one).
 
@@ -169,7 +169,7 @@ Then open the printed URL, e.g. `http://100.x.y.z:8090/`.
 ### Without Tailscale (LAN / intranet)
 
 Tailscale is **optional** — it's only used to auto-pick the bind address. From
-a clean clone the only hard requirements are **Node 18+** and **tmux**. Without
+a clean clone the only hard requirements are **Bun** and **tmux**. Without
 tailscale, set `HOST` yourself:
 
 ```bash
@@ -235,7 +235,7 @@ Tailscale) is still coming up at boot.
   (`journalctl --user -u terminal-web -f`).
 
 After editing **server** code run `scripts/service.sh restart`; after editing
-**frontend** code run `npm run build` (the service serves the prebuilt bundle).
+**frontend** code run `bun run build` (the service serves the prebuilt bundle).
 
 ---
 
@@ -352,9 +352,9 @@ The `?` help overlay summarizes these (with the right keys for your OS).
 ## Environment variables
 
 All are optional. Copy `.env.example` to `.env` to override defaults. `.env` is
-loaded by `scripts/start.sh` and `scripts/dev.sh` (`npm run dev`). Running
-`npm start` (tsx) directly does **not** auto-load `.env` — export the vars in
-your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
+loaded by `scripts/start.sh` and `scripts/dev.sh` (`bun run dev`). Running
+`bun start` directly does **not** auto-load `.env` -- export the vars in
+your shell instead, e.g. `HOST=100.x.y.z PORT=8090 bun start`.
 
 | Variable          | Default                                              | Description                                                                 |
 | ----------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
