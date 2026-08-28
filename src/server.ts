@@ -839,6 +839,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
       if (!isClientMessage(parsed)) return;
 
       if (parsed.type === "resize") {
+        if (closed) return;
         const cols = Math.max(1, Math.floor(parsed.cols));
         const rows = Math.max(1, Math.floor(parsed.rows));
         if (Number.isFinite(cols) && Number.isFinite(rows)) {
