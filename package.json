@@ -3,15 +3,14 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A web-based terminal (xterm.js + node-pty) that runs your shell inside tmux for resumable sessions.",
+  "description": "A web-based terminal (xterm.js + Bun.Terminal) that runs your shell inside tmux for resumable sessions.",
   "license": "MIT",
   "author": "AaronFei",
   "scripts": {
     "dev": "bash scripts/dev.sh",
     "build": "bun esbuild.mjs",
     "start": "bun --no-env-file src/server.ts",
-    "lint": "oxlint src web",
-    "postinstall": "bun scripts/fix-pty-perms.mjs"
+    "lint": "oxlint src web"
   },
   "dependencies": {
     "ws": "^8.18.0"
