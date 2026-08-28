@@ -120,6 +120,7 @@ export function tagWebSession(name: string, attempt = 0): void {
 export function setWebTabLabel(name: string, displayName: string): void {
   // Strip control chars (newlines/tabs) so a label can never break the
   // space-delimited parsing in listWebTabs.
+  // oxlint-disable-next-line no-control-regex
   const dn = displayName.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
   execFile("tmux", ["set-option", "-t", name, TAB_LABEL, dn], () => {});
 }

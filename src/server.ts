@@ -747,6 +747,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   const daSeen: Record<"?" | ">", boolean> = { "?": false, ">": false };
   const filterDaReplies = (input: string): string => {
     if (!input.includes("\x1b[")) return input;
+    // oxlint-disable-next-line no-control-regex
     return input.replace(/\x1b\[([?>])[0-9;]*c/g, (seq, kind: "?" | ">") => {
       if (!daSeen[kind] && Date.now() - attachedAt <= DA_WINDOW_MS) {
         daSeen[kind] = true;

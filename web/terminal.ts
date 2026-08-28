@@ -520,6 +520,7 @@ class Session {
       const now = performance.now();
       // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
       if (
+        // oxlint-disable-next-line no-control-regex
         /[^\x00-\x7F]/.test(data) &&
         data === this.lastData &&
         now - this.lastDataAt < IME_DEDUP_MS
@@ -1559,6 +1560,7 @@ function refreshModVisuals(): void {
 
 function applyMods(seq: string): string {
   if (!ctrlArmed && !altArmed) return seq;
+  // oxlint-disable-next-line no-control-regex
   if (/^\x1b\[[ABCD]$/.test(seq)) {
     const mod = 1 + (altArmed ? 2 : 0) + (ctrlArmed ? 4 : 0);
     return `\x1b[1;${mod}${seq[seq.length - 1]}`;
