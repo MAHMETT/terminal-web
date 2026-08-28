@@ -7,7 +7,6 @@ import { execFile } from "node:child_process";
 import { URL } from "node:url";
 
 import { WebSocketServer, WebSocket } from "ws";
-import * as pty from "node-pty";
 
 import { loadConfig } from "./config.js";
 import {
@@ -30,21 +29,19 @@ const config = loadConfig();
 // shows up in /api/sessions immediately, before its tag write has landed.
 const liveSessions = new Set<string>();
 
+/** A live pty + its child process, wrapping Bun.Terminal + Bun.spawn. */
+interface LivePty {
+  terminal: Bun.Terminal;
+  subprocess: Bun.Subprocess;
+  pid: number;
+}
+
 // Every pty currently alive (one per attached WebSocket). Its size is capped at
 // config.maxPtys before we ever spawn another tmux client, so a runaway or
 // rapidly-reconnecting client can't exhaust the host's small system-wide pty
 // table (macOS kern.tty.ptmx_max is only ~511) and lock everything — including
 // new SSH logins — out of allocating a terminal.
-const livePtys = new Set<pty.IPty>();
-
-// node-pty 1.1.0 leaked ~3 fds per spawn on macOS (an untracked "twin" /dev/ptmx
-// master, the slave /dev/ttysN, and a kqueue) — destroy() closed only the
-// tracked master, so reconnect churn once crept toward macOS's ~511 pty cap and
-// locked SSH out (the 2026-06-13 incident). We used to reap the twin ourselves
-// at spawn. node-pty 1.2.0-beta.14 closes all of them on teardown (verified: a
-// spawn→kill→destroy loop leaks ~0.03 fds vs 1.1.0's ~3), so the reaper is gone
-// and plain pty.spawn() is used below. The pty-fd watchdog still backstops any
-// future regression.
+const livePtys = new Set<LivePty>();
 
 // Every WebSocket currently attached to each session name. Used to tell the
 // *other* devices on a session that it was closed, so they drop the tab instead
@@ -700,15 +697,30 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     return;
   }
 
-  let proc: pty.IPty;
+  let livePty: LivePty;
   try {
-    proc = pty.spawn("tmux", tmuxArgs(session, config.tmuxConfPath), {
-      name: "xterm-256color",
+    const terminal = new Bun.Terminal({
       cols: DEFAULT_COLS,
       rows: DEFAULT_ROWS,
-      cwd: os.homedir(),
-      env: buildChildEnv(),
+      data(_term, data) {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          // Bun.Terminal emits Uint8Array; send raw bytes so xterm gets exact output.
+          ws.send(data, { binary: true });
+        } catch (err) {
+          console.error("[ws] send error:", err);
+        }
+      },
     });
+    const subprocess = Bun.spawn(
+      ["tmux", ...tmuxArgs(session, config.tmuxConfPath)],
+      {
+        terminal,
+        cwd: os.homedir(),
+        env: buildChildEnv(),
+      }
+    );
+    livePty = { terminal, subprocess, pid: subprocess.pid };
   } catch (err) {
     console.error(`[ws] failed to spawn tmux for session "${session}":`, err);
     sendJson(ws, { type: "info", message: "Failed to start terminal session." });
@@ -720,9 +732,9 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     return;
   }
 
-  livePtys.add(proc);
+  livePtys.add(livePty);
   console.log(
-    `[ws] connected -> tmux session "${session}" (pid ${proc.pid}) ` +
+    `[ws] connected -> tmux session "${session}" (pid ${livePty.pid}) ` +
       `[${livePtys.size}/${config.maxPtys} ptys]`
   );
 
@@ -764,44 +776,27 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
     if (closed) return;
     closed = true;
     liveSessions.delete(session);
-    livePtys.delete(proc);
+    livePtys.delete(livePty);
     try {
-      // Killing the pty only detaches this tmux client; the server/session
-      // persist so the session can be resumed on reconnect.
-      proc.kill();
+      livePty.subprocess.kill();
     } catch (err) {
       console.error("[ws] error killing pty:", err);
     }
-    // kill() only signals the child — node-pty closes the TRACKED master fd
-    // (proc.fd) when its ReadStream reaches EOF, but ws.on("close") disposes
-    // onData first, pausing that stream, so the close can lag. destroy() force-
-    // closes it (and, on node-pty 1.2, the slave + kqueue) promptly. IPty's
-    // public typing omits destroy(); the runtime UnixTerminal has it.
     try {
-      (proc as unknown as { destroy?: () => void }).destroy?.();
+      livePty.terminal.close();
     } catch (err) {
-      console.error("[ws] error destroying pty:", err);
+      console.error("[ws] error closing terminal:", err);
     }
   };
 
-  // pty output -> ws (binary)
-  const onData = proc.onData((data: string) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
-    try {
-      // node-pty emits strings; send raw bytes so xterm gets exact output.
-      ws.send(Buffer.from(data, "utf8"), { binary: true });
-    } catch (err) {
-      console.error("[ws] send error:", err);
-    }
-  });
-
-  const onExit = proc.onExit(({ exitCode, signal }) => {
+  // Watch for pty exit
+  livePty.subprocess.exited.then((exitCode) => {
     console.log(
-      `[ws] pty for "${session}" exited (code ${exitCode}, signal ${signal ?? "none"})`
+      `[ws] pty for "${session}" exited (code ${exitCode})`
     );
-    closed = true; // pty is already gone; avoid kill() in cleanup
+    closed = true;
     liveSessions.delete(session);
-    livePtys.delete(proc);
+    livePtys.delete(livePty);
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
       try {
         ws.close(1000, "pty exited");
@@ -820,7 +815,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
           ? Buffer.concat(data.map((d) => Buffer.from(d)))
           : Buffer.from(data as ArrayBuffer);
         const input = filterDaReplies(buf.toString("utf8"));
-        if (input) proc.write(input);
+        if (input) livePty.terminal.write(input);
         return;
       }
 
@@ -844,7 +839,7 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
         const rows = Math.max(1, Math.floor(parsed.rows));
         if (Number.isFinite(cols) && Number.isFinite(rows)) {
           try {
-            proc.resize(cols, rows);
+            livePty.terminal.resize(cols, rows);
           } catch (err) {
             console.error("[ws] resize error:", err);
           }
@@ -901,8 +896,6 @@ wss.on("connection", (rawWs: WebSocket, req: http.IncomingMessage) => {
   });
 
   ws.on("close", () => {
-    onData.dispose();
-    onExit.dispose();
     removeSessionClient(session, ws);
     cleanup();
     console.log(`[ws] disconnected from "${session}" (tmux session persists)`);
@@ -965,22 +958,11 @@ const heartbeat = setInterval(() => {
 }, HEARTBEAT_MS);
 heartbeat.unref();
 
-// Safety net for pty-fd leaks we can't fix from JS: a failed pty.spawn() can
-// orphan a master fd in node-pty's native layer (the throw leaves us no handle
-// to close), and we can't rule out other node-pty leaks. The destroy() in
-// cleanup() fixes the known disconnect leak, but ANY residual leak must never be
-// allowed to creep up to macOS's ~511 system-wide pty cap and lock SSH out
-// again (the 2026-06-13 incident). Periodically count THIS process's open pty
+// Safety net for pty-fd leaks: periodically count THIS process's open pty
 // masters (character-device fds) via /dev/fd; if they exceed a ceiling far below
 // the system limit but well above maxPtys, log loudly and exit so launchd
 // (KeepAlive) restarts us cleanly. The tmux sessions live in a separate server
 // process and survive, so clients just reconnect into them.
-//
-// node-pty 1.2 holds ~2 character-device fds per LIVE pty (the /dev/ptmx master
-// plus the slave /dev/ttysN); older builds held more. The ceiling stays at
-// 4 * maxPtys (+ a little for stdio) — comfortably above the real footprint at
-// capacity, yet still hundreds of fds short of the ~511 system cap, so it trips
-// only on a genuine leak.
 const PTY_FD_CEILING = config.maxPtys * 4 + 16;
 
 function countOwnPtyFds(): number {

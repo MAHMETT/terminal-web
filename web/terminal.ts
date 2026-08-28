@@ -559,9 +559,90 @@ function isActive(s: Session): boolean { return activeSession === s; }
 function reflectActiveStatus(): void { if (activeSession && activeSession.connected) hideStatus(); else showStatus('reconnecting…'); }
 function updateTabDot(s: Session): void { s.tabDot?.classList.toggle('connected', s.connected); refreshMobileUI(); }
 
+// ---------------------------------------------------------------------------
+// Tab drag-and-drop reordering
+// ---------------------------------------------------------------------------
+const tabDragState: { draggingId: string | null; ghost: HTMLElement | null; moved: boolean; startX: number; startY: number; offsetX: number; offsetY: number } = { draggingId: null, ghost: null, moved: false, startX: 0, startY: 0, offsetX: 0, offsetY: 0 };
+
+function onTabPointerDown(e: PointerEvent, s: Session, el: HTMLElement): void {
+  if ((e.target as HTMLElement).classList.contains('close')) return;
+  tabDragState.startX = e.clientX;
+  tabDragState.startY = e.clientY;
+  tabDragState.moved = false;
+  const moveHandler = (ev: PointerEvent) => onTabPointerMove(ev, s, el);
+  const upHandler = (ev: PointerEvent) => {
+    onTabPointerUp(ev, s);
+    document.removeEventListener('pointermove', moveHandler);
+    document.removeEventListener('pointerup', upHandler);
+  };
+  document.addEventListener('pointermove', moveHandler);
+  document.addEventListener('pointerup', upHandler);
+}
+
+function onTabPointerMove(e: PointerEvent, s: Session, el: HTMLElement): void {
+  const dx = e.clientX - tabDragState.startX;
+  const dy = e.clientY - tabDragState.startY;
+  if (!tabDragState.moved && Math.hypot(dx, dy) > 6) {
+    tabDragState.moved = true;
+    tabDragState.draggingId = s.name;
+    const rect = el.getBoundingClientRect();
+    const ghost = el.cloneNode(true) as HTMLElement;
+    ghost.className = 'tab active';
+    ghost.style.position = 'fixed';
+    ghost.style.width = rect.width + 'px';
+    ghost.style.left = rect.left + 'px';
+    ghost.style.top = rect.top + 'px';
+    ghost.style.zIndex = '70';
+    ghost.style.pointerEvents = 'none';
+    ghost.style.boxShadow = '0 14px 34px rgba(0,0,0,0.4)';
+    ghost.style.borderRadius = '8px 8px 0 0';
+    ghost.style.background = 'var(--pane)';
+    ghost.style.opacity = '0.96';
+    document.body.appendChild(ghost);
+    tabDragState.ghost = ghost;
+    tabDragState.offsetX = e.clientX - rect.left;
+    tabDragState.offsetY = e.clientY - rect.top;
+    el.style.opacity = '0.3';
+  }
+  if (tabDragState.moved) {
+    tabDragState.ghost!.style.left = (e.clientX - tabDragState.offsetX) + 'px';
+    tabDragState.ghost!.style.top = (e.clientY - tabDragState.offsetY) + 'px';
+    reorderByPointer(e);
+  }
+}
+
+function reorderByPointer(e: PointerEvent): void {
+  const els = [...tabsEl.querySelectorAll('.tab')].filter((el) => el.getAttribute('data-name') !== tabDragState.draggingId);
+  let insertBefore: string | null = null;
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (e.clientX < r.left + r.width / 2) { insertBefore = el.getAttribute('data-name'); break; }
+  }
+  const curIdx = sessions.findIndex((s) => s.name === tabDragState.draggingId);
+  if (curIdx < 0) return;
+  const [dragged] = sessions.splice(curIdx, 1);
+  if (insertBefore === null) sessions.push(dragged);
+  else sessions.splice(sessions.findIndex((s) => s.name === insertBefore), 0, dragged);
+  saveTabs();
+}
+
+function onTabPointerUp(_e: PointerEvent, s: Session): void {
+  if (!tabDragState.moved) {
+    activateSession(s);
+  } else {
+    if (tabDragState.ghost) { tabDragState.ghost.remove(); tabDragState.ghost = null; }
+    tabDragState.draggingId = null;
+    tabDragState.moved = false;
+    const tabEl = s.tabEl;
+    if (tabEl) tabEl.style.opacity = '';
+    saveTabs();
+  }
+}
+
 function buildTab(s: Session): void {
   const tab = document.createElement('div');
   tab.className = 'tab';
+  tab.setAttribute('data-name', s.name);
   const dot = document.createElement('span');
   dot.className = 'dot';
   const label = document.createElement('span');
@@ -574,14 +655,15 @@ function buildTab(s: Session): void {
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
+  // Tab drag-and-drop reordering via pointer events
+  tab.addEventListener('pointerdown', (e) => onTabPointerDown(e, s, tab));
+  // Double-click to rename
   let lastTap = 0;
   tab.addEventListener('pointerdown', (e) => {
-    if (e.target === close) return;
-    e.preventDefault();
+    if ((e.target as HTMLElement).classList.contains('close')) return;
     const now = performance.now();
     if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
     lastTap = now;
-    activateSession(s);
   });
   close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); confirmCloseSession(s); });
 
@@ -607,6 +689,25 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
   updateStatusBar();
   return s;
 }
+
+// ---------------------------------------------------------------------------
+// Split-tree pane system (from reference design)
+// Each tab stores a tree; leaf nodes hold Session references.
+// ---------------------------------------------------------------------------
+// Split-tree types are reserved for future multi-pane splitting support
+// interface SplitLeaf {
+//   type: 'leaf';
+//   id: number;
+//   session: Session | null;
+// }
+// interface SplitNode {
+//   type: 'split';
+//   dir: 'row' | 'col';
+//   ratio: number[];
+//   children: (SplitLeaf | SplitNode)[];
+// }
+// Split-tree types are defined for future pane splitting support
+// type SplitTree = SplitLeaf | SplitNode;
 
 function activateSession(s: Session): void {
   if (activeSession && activeSession !== s) activeSession.setActive(false);

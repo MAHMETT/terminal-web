@@ -14,10 +14,10 @@
     "postinstall": "bun scripts/fix-pty-perms.mjs"
   },
   "dependencies": {
-    "node-pty": "1.2.0-beta.14",
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.0",
     "@types/node": "^20.14.0",
     "@types/ws": "^8.5.10",
     "@xterm/addon-fit": "^0.10.0",
