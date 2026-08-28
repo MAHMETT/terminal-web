@@ -32,7 +32,6 @@ function sanitizeName(raw: string | null | undefined): string | null {
   return cleaned.length ? cleaned : null;
 }
 
-
 async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
   try {
@@ -164,7 +163,10 @@ const THEMES: Record<string, ThemeDef> = {
   nord:    { name: 'Nord Mist',       bg: '#1b2028', panel: '#212734', pane: '#171b22', paneAlt: '#141820', border: '#2c3341', borderSoft: '#242a36', text: '#e3e8f0', muted: '#7f8ba1', dim: '#565f70', accent: '#7fb2f0', accent2: '#f0a37f' },
   solaris: { name: 'Solaris Light',   bg: '#f6f5f1', panel: '#ffffff', pane: '#fbfaf7', paneAlt: '#f1efe9', border: '#e2e0d8', borderSoft: '#ebe9e2', text: '#2a2b28', muted: '#7a7972', dim: '#a4a297', accent: '#1f8a70', accent2: '#b5533c' },
   ink:     { name: 'Mono Ink',        bg: '#121212', panel: '#181818', pane: '#0e0e0e', paneAlt: '#0a0a0a', border: '#262626', borderSoft: '#1e1e1e', text: '#eaeaea', muted: '#8f8f8f', dim: '#5a5a5a', accent: '#f5f5f5', accent2: '#9a9a9a' },
+  custom:  { name: 'Custom',          bg: '#171a20', panel: '#1d212a', pane: '#12151b', paneAlt: '#0d1017', border: '#2a3140', borderSoft: '#222838', text: '#e8ebf0', muted: '#8890a0', dim: '#5c6370', accent: '#f2a65a', accent2: '#7fb2f0' },
 };
+let currentTheme = 'aurora';
+
 function pushCssVars(t: ThemeDef): void {
   const r = document.documentElement.style;
   r.setProperty('--bg', t.bg);
@@ -179,7 +181,7 @@ function pushCssVars(t: ThemeDef): void {
   r.setProperty('--accent', t.accent);
   r.setProperty('--accent2', t.accent2);
   r.setProperty('--accent-soft', t.accent + '24');
-  // Update xterm theme to match
+  // Update xterm theme
   XTERM_THEME.background = t.pane;
   XTERM_THEME.foreground = t.text;
   XTERM_THEME.cursor = t.accent;
@@ -187,13 +189,8 @@ function pushCssVars(t: ThemeDef): void {
   XTERM_THEME.selectionBackground = t.accent;
 }
 
-
-// xterm theme (starts with aurora; pushed by applyTheme)
 const XTERM_THEME: Record<string, string> = {
-  background: '#101217',
-  foreground: '#e7e9ee',
-  cursor: '#5eead4',
-  cursorAccent: '#101217',
+  background: '#101217', foreground: '#e7e9ee', cursor: '#5eead4', cursorAccent: '#101217',
   selectionBackground: '#5eead4',
   black: '#000000', red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
   blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd', white: '#e5e5e5',
@@ -206,15 +203,21 @@ const XTERM_THEME: Record<string, string> = {
 // DOM refs
 // ---------------------------------------------------------------------------
 const root = document.documentElement;
-const termArea = document.getElementById('terminal')!;
+const paneGrid = document.getElementById('paneGrid')!;
 const keybarEl = document.getElementById('keybar')!;
 const statusEl = document.getElementById('status');
 const tabsEl = document.getElementById('tabs')!;
-const controlsEl = document.getElementById('controls')!;
-
+const overlayEl = document.getElementById('overlay')!;
+const drawerEl = document.getElementById('drawer')!;
+const drawerBody = document.getElementById('drawerBody')!;
+const drawerTabsEl = document.getElementById('drawerTabs')!;
 const connDot = document.getElementById('connDot')!;
 const connLabel = document.getElementById('connLabel')!;
 const layoutLabel = document.getElementById('layoutLabel')!;
+const toastEl = document.getElementById('toast')!;
+const modalOverlay = document.getElementById('modalOverlay')!;
+const newTabInput = document.getElementById('newTabInput') as HTMLInputElement;
+
 
 let currentFont = (() => {
   try {
@@ -223,6 +226,17 @@ let currentFont = (() => {
   } catch { /* ignore */ }
   return 14;
 })();
+
+// Settings state
+const settings = {
+  font: 'JetBrains Mono',
+  fontSize: currentFont,
+  lineHeight: 1.6,
+  cursorStyle: 'bar' as 'bar' | 'block' | 'underline',
+  cursorBlink: true,
+  confirmClose: true,
+  bellSound: false,
+};
 
 function showStatus(text: string): void {
   if (!statusEl) return;
@@ -236,6 +250,15 @@ function flashStatus(text: string, ms: number): void {
 }
 function fmtMB(bytes: number): string { return (bytes / (1024 * 1024)).toFixed(1); }
 
+// Toast
+let toastTimer: ReturnType<typeof setTimeout>;
+function showToast(msg: string): void {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
+}
+
 // ---------------------------------------------------------------------------
 // Session class — one real terminal per tmux session
 // ---------------------------------------------------------------------------
@@ -243,7 +266,10 @@ class Session {
   readonly name: string;
   displayName: string;
   readonly term: Terminal;
-  readonly el: HTMLElement;
+  readonly el: HTMLElement;          // xterm container
+  paneEl: HTMLElement | null = null; // .pane wrapper
+  paneHead: HTMLElement | null = null;
+  panePath: HTMLElement | null = null;
   tabEl: HTMLElement | null = null;
   tabLabel: HTMLElement | null = null;
   tabDot: HTMLElement | null = null;
@@ -266,9 +292,9 @@ class Session {
     this.name = name;
     this.displayName = displayName?.trim() || name;
     this.term = new Terminal({
-      cursorBlink: true,
+      cursorBlink: settings.cursorBlink,
       fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: currentFont,
+      fontSize: settings.fontSize,
       scrollback: 100000,
       allowProposedApi: true,
       macOptionClickForcesSelection: true,
@@ -276,9 +302,37 @@ class Session {
     });
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
+
+    // Build pane wrapper: .pane > .pane-head + .pane-body > xterm el
+    this.paneEl = document.createElement('div');
+    this.paneEl.className = 'pane';
+
+    this.paneHead = document.createElement('div');
+    this.paneHead.className = 'pane-head';
+    this.panePath = document.createElement('span');
+    this.panePath.className = 'pane-path';
+    this.panePath.textContent = `◦ zsh — ${this.displayName}`;
+    const paneActions = document.createElement('div');
+    paneActions.className = 'pane-actions';
+    // Split / close buttons (visual for now; real splitting deferred)
+    const splitR = document.createElement('button');
+    splitR.className = 'mini-btn'; splitR.title = 'Split right'; splitR.textContent = '⬒';
+    splitR.addEventListener('click', (e) => { e.stopPropagation(); showToast('Split right — coming soon'); });
+    const splitB = document.createElement('button');
+    splitB.className = 'mini-btn'; splitB.title = 'Split bottom'; splitB.textContent = '⬓';
+    splitB.addEventListener('click', (e) => { e.stopPropagation(); showToast('Split bottom — coming soon'); });
+    const closePane = document.createElement('button');
+    closePane.className = 'mini-btn danger'; closePane.title = 'Close panel'; closePane.textContent = '✕';
+    closePane.addEventListener('click', (e) => { e.stopPropagation(); confirmCloseSession(this); });
+    paneActions.append(splitR, splitB, closePane);
+    this.paneHead.append(this.panePath, paneActions);
+
     this.el = document.createElement('div');
-    this.el.className = 'term-pane hidden';
-    termArea.append(this.el);
+    this.el.className = 'pane-body hidden';
+
+    this.paneEl.append(this.paneHead, this.el);
+    paneGrid.append(this.paneEl);
+
     this.term.open(this.el);
     if (WEBGL_ENABLED) {
       try { const webgl = new WebglAddon(); webgl.onContextLoss(() => webgl.dispose()); this.term.loadAddon(webgl); } catch { /* fallback */ }
@@ -453,7 +507,9 @@ class Session {
 
   setActive(active: boolean): void {
     this.el.classList.toggle('hidden', !active);
+    this.paneEl?.classList.toggle('focused', active);
     if (active) {
+      this.panePath!.textContent = `◦ zsh — ${this.displayName}`;
       requestAnimationFrame(() => {
         this.fit();
         if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
@@ -491,14 +547,14 @@ class Session {
 
   private scheduleReconnect(): void {
     if (this.disposed || this.reconnectTimer !== null) return;
-    if (isActive(this)) showStatus('reconnecting…');
+    if (isActive(this)) showStatus('reconnecting...');
     const base = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_DELAY);
     const delay = Math.round(base * (0.5 + Math.random()));
     this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect(); }, delay);
   }
 
-  private connect(): void {
+  connect(): void {
     if (this.disposed) return;
     const url = `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}`;
     const socket = new WebSocket(url);
@@ -545,7 +601,7 @@ class Session {
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
     try { this.term.dispose(); } catch { /* ignore */ }
-    this.el.remove();
+    this.paneEl?.remove();
   }
 }
 
@@ -556,7 +612,7 @@ const sessions: Session[] = [];
 let activeSession: Session | null = null;
 
 function isActive(s: Session): boolean { return activeSession === s; }
-function reflectActiveStatus(): void { if (activeSession && activeSession.connected) hideStatus(); else showStatus('reconnecting…'); }
+function reflectActiveStatus(): void { if (activeSession && activeSession.connected) hideStatus(); else showStatus('reconnecting...'); }
 function updateTabDot(s: Session): void { s.tabDot?.classList.toggle('connected', s.connected); refreshMobileUI(); }
 
 // ---------------------------------------------------------------------------
@@ -636,6 +692,7 @@ function onTabPointerUp(_e: PointerEvent, s: Session): void {
     const tabEl = s.tabEl;
     if (tabEl) tabEl.style.opacity = '';
     saveTabs();
+    showToast('Tab order updated');
   }
 }
 
@@ -643,6 +700,8 @@ function buildTab(s: Session): void {
   const tab = document.createElement('div');
   tab.className = 'tab';
   tab.setAttribute('data-name', s.name);
+  tab.setAttribute('role', 'tab');
+  tab.setAttribute('aria-selected', 'false');
   const dot = document.createElement('span');
   dot.className = 'dot';
   const label = document.createElement('span');
@@ -655,9 +714,7 @@ function buildTab(s: Session): void {
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
-  // Tab drag-and-drop reordering via pointer events
   tab.addEventListener('pointerdown', (e) => onTabPointerDown(e, s, tab));
-  // Double-click to rename
   let lastTap = 0;
   tab.addEventListener('pointerdown', (e) => {
     if ((e.target as HTMLElement).classList.contains('close')) return;
@@ -690,30 +747,14 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
   return s;
 }
 
-// ---------------------------------------------------------------------------
-// Split-tree pane system (from reference design)
-// Each tab stores a tree; leaf nodes hold Session references.
-// ---------------------------------------------------------------------------
-// Split-tree types are reserved for future multi-pane splitting support
-// interface SplitLeaf {
-//   type: 'leaf';
-//   id: number;
-//   session: Session | null;
-// }
-// interface SplitNode {
-//   type: 'split';
-//   dir: 'row' | 'col';
-//   ratio: number[];
-//   children: (SplitLeaf | SplitNode)[];
-// }
-// Split-tree types are defined for future pane splitting support
-// type SplitTree = SplitLeaf | SplitNode;
-
 function activateSession(s: Session): void {
   if (activeSession && activeSession !== s) activeSession.setActive(false);
   activeSession = s;
   s.setActive(true);
-  for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
+  for (const x of sessions) {
+    x.tabEl?.classList.toggle('active', x === s);
+    x.tabEl?.setAttribute('aria-selected', x === s ? 'true' : 'false');
+  }
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   reflectActiveStatus();
   refreshMobileUI();
@@ -783,16 +824,10 @@ function nextSessionName(): string {
   return `s${i}`;
 }
 
-async function promptAddSession(): Promise<void> {
-  const suggestion = nextSessionName();
-  const raw = await domPrompt({ label: 'New session name:', value: suggestion, okText: 'Create' });
-  if (raw === null) return;
-  addSession(sanitizeName(raw) ?? suggestion, true);
-}
-
 function setDisplayName(s: Session, displayName: string): void {
   s.displayName = displayName;
   if (s.tabLabel) { s.tabLabel.textContent = displayName; s.tabLabel.title = `session: ${s.name} (double-click to rename)`; }
+  if (s.panePath) s.panePath.textContent = `◦ zsh — ${displayName}`;
   refreshMobileUI();
 }
 
@@ -959,7 +994,7 @@ async function syncFromServer(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Layout: key bar height + iOS keyboard offset
+// Layout helpers
 // ---------------------------------------------------------------------------
 function fitActive(): void { activeSession?.fit(); }
 
@@ -994,33 +1029,28 @@ function updateStatusBar(): void {
   if (activeSession) {
     connDot.classList.toggle('reconnecting', !activeSession.connected);
     connDot.style.background = activeSession.connected ? '#86efac' : '#f0b429';
-    connLabel.textContent = activeSession.connected ? 'connected' : 'reconnecting…';
+    connLabel.textContent = activeSession.connected ? 'connected' : 'reconnecting...';
     layoutLabel.textContent = '1 panel';
   }
 }
 
 // ---------------------------------------------------------------------------
-// Top-bar controls + on-screen key bar
+// Toolbar buttons (reference design)
 // ---------------------------------------------------------------------------
-function makeButton(parent: HTMLElement, cls: string, label: string, title: string, onTap: () => void): HTMLButtonElement {
-  const b = document.createElement('button');
-  b.className = cls;
-  b.type = 'button';
-  b.textContent = label;
-  b.title = title;
-  b.setAttribute('aria-label', title);
-  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
-  parent.append(b);
-  return b;
-}
+// Layout buttons (visual only for now)
+document.getElementById('layoutSingle')?.addEventListener('click', () => { showToast('Single layout'); });
+document.getElementById('layoutV')?.addEventListener('click', () => { showToast('Split right — coming soon'); });
+document.getElementById('layoutH')?.addEventListener('click', () => { showToast('Split bottom — coming soon'); });
+document.getElementById('layoutGrid')?.addEventListener('click', () => { showToast('Grid 2x2 — coming soon'); });
 
-function changeFont(delta: number): void {
-  currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
-  try { localStorage.setItem('tw.fontSize', String(currentFont)); } catch { /* ignore */ }
-  for (const s of sessions) s.setFont(currentFont);
-  activeSession?.focus();
-}
+// Clear
+document.getElementById('clearBtn')?.addEventListener('click', () => {
+  activeSession?.term.clear();
+  showToast('Panel cleared');
+});
 
+// Fullscreen
+document.getElementById('fullscreenBtn')?.addEventListener('click', toggleFullscreen);
 function toggleFullscreen(): void {
   const d = document as Document & { webkitFullscreenElement?: Element; webkitExitFullscreen?: () => void };
   const el = root as HTMLElement & { webkitRequestFullscreen?: () => void };
@@ -1029,58 +1059,352 @@ function toggleFullscreen(): void {
   setTimeout(() => fitActive(), 100);
 }
 
-// Build controls
-// Settings button (gear icon)
-makeButton(controlsEl, 'tb-btn', '⚙', 'Settings', () => openDrawer());
-// Sessions list button
-makeButton(controlsEl, 'tb-btn', '☰', 'Sessions', () => openDrawer());
-makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
-makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
-let keysBtn: HTMLButtonElement | null = null;
-keysBtn = makeButton(controlsEl, 'tb-btn', '⌨', 'Toggle on-screen keys', () => {
-  setKeybarVisible(keybarEl.classList.contains('hidden'));
-  activeSession?.focus();
+// Settings button
+document.getElementById('settingsBtn')?.addEventListener('click', openDrawer);
+
+// Add tab button
+document.getElementById('addTab')?.addEventListener('click', openNewTabModal);
+
+// Search box (placeholder)
+document.querySelector('.search-box')?.addEventListener('click', () => {
+  showToast('Terminal search — coming soon');
 });
-makeButton(controlsEl, 'tb-btn', '⟳', 'Restart this session', () => { activeSession?.restart(); activeSession?.focus(); });
 
-// File attach
-const fileInput = document.createElement('input');
-fileInput.type = 'file';
-fileInput.multiple = true;
-fileInput.style.display = 'none';
-document.body.append(fileInput);
-fileInput.addEventListener('change', () => {
-  if (fileInput.files) { for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name); }
-  fileInput.value = '';
+// ---------------------------------------------------------------------------
+// Settings drawer
+// ---------------------------------------------------------------------------
+let drawerTab = 'appearance';
+
+function openDrawer(): void {
+  renderDrawer();
+  overlayEl.classList.add('open');
+  drawerEl.classList.add('open');
+}
+function closeDrawer(): void {
+  overlayEl.classList.remove('open');
+  drawerEl.classList.remove('open');
+  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
+}
+overlayEl.addEventListener('click', closeDrawer);
+document.getElementById('closeDrawer')?.addEventListener('click', closeDrawer);
+
+// Drawer tab switching
+drawerTabsEl.addEventListener('click', (e) => {
+  const tab = (e.target as HTMLElement).closest('.dtab');
+  if (tab) {
+    drawerTab = (tab as HTMLElement).dataset.tab ?? 'appearance';
+    renderDrawer();
+  }
 });
-const fileBtn = document.createElement('button');
-fileBtn.className = 'tb-btn';
-fileBtn.type = 'button';
-fileBtn.title = 'Attach a file (upload + insert path)';
-fileBtn.setAttribute('aria-label', 'Attach a file');
-fileBtn.textContent = '📎';
-fileBtn.addEventListener('click', () => fileInput.click());
-controlsEl.append(fileBtn);
 
-// Download
-const dlBtn = document.createElement('button');
-dlBtn.className = 'tb-btn';
-dlBtn.type = 'button';
-dlBtn.title = 'Download a file from the host';
-dlBtn.setAttribute('aria-label', 'Download a file from the host');
-dlBtn.textContent = '⬇';
-dlBtn.addEventListener('click', () => {
-  void (async () => {
-    const p = await domPrompt({ label: 'Download a file from the host — enter its full path', value: '~/', okText: 'Download' });
-    if (p) void downloadFromHost(p);
-  })();
+function renderDrawer(): void {
+  // Update active tab state
+  drawerTabsEl.querySelectorAll('.dtab').forEach((b) => {
+    b.classList.toggle('active', (b as HTMLElement).dataset.tab === drawerTab);
+  });
+
+  if (drawerTab === 'appearance') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">Theme</div>
+        <div class="theme-grid" id="themeGrid"></div>
+        <div class="color-grid" id="customColors" style="display:none"></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Typography</div>
+        <div class="row"><label>Terminal font</label>
+          <select id="fontSelect">
+            ${['JetBrains Mono', 'Fira Code', 'Cascadia Code', 'IBM Plex Mono'].map((f) => `<option ${settings.font === f ? 'selected' : ''}>${f}</option>`).join('')}
+          </select>
+        </div>
+        <div class="row"><label>Font size<span class="hint">${settings.fontSize}px</span></label>
+          <input type="range" id="fontSize" min="11" max="20" value="${settings.fontSize}">
+        </div>
+        <div class="row"><label>Line height<span class="hint">${settings.lineHeight.toFixed(1)}</span></label>
+          <input type="range" id="lineHeight" min="1.1" max="2" step="0.1" value="${settings.lineHeight}">
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-title">Cursor</div>
+        <div class="row"><label>Cursor style</label>
+          <div class="seg" id="cursorSeg">
+            ${['bar', 'block', 'underline'].map((s) => `<button data-v="${s}" class="${settings.cursorStyle === s ? 'active' : ''}">${s}</button>`).join('')}
+          </div>
+        </div>
+        <div class="row"><label>Blink cursor</label>
+          <div class="switch ${settings.cursorBlink ? 'on' : ''}" id="blinkSwitch"></div>
+        </div>
+      </div>`;
+
+    // Theme grid
+    const grid = document.getElementById('themeGrid')!;
+    for (const key of ['aurora', 'nord', 'solaris', 'ink']) {
+      const t = THEMES[key];
+      const card = document.createElement('div');
+      card.className = 'theme-card' + (key === currentTheme ? ' selected' : '');
+      card.innerHTML = `<div class="swatch-row">
+          <div class="swatch" style="background:${t.bg}"></div>
+          <div class="swatch" style="background:${t.accent}"></div>
+          <div class="swatch" style="background:${t.accent2}"></div>
+        </div><div class="theme-name">${t.name}</div>`;
+      card.addEventListener('click', () => { applyTheme(key); showToast(`Theme: ${t.name}`); });
+      grid.appendChild(card);
+    }
+    // Custom theme card
+    const customCard = document.createElement('div');
+    customCard.id = 'customThemeCard';
+    customCard.className = 'theme-card' + (currentTheme === 'custom' ? ' selected' : '');
+    customCard.innerHTML = `<div class="swatch-row">
+        <div class="swatch sw-bg" style="background:${THEMES.custom.bg}"></div>
+        <div class="swatch sw-accent" style="background:${THEMES.custom.accent}"></div>
+        <div class="swatch sw-accent2" style="background:${THEMES.custom.accent2}"></div>
+      </div><div class="theme-name">Custom</div>`;
+    customCard.addEventListener('click', () => { applyTheme('custom'); renderDrawer(); showToast('Custom theme active — edit colors below'); });
+    grid.appendChild(customCard);
+
+    // Custom color pickers
+    const colorGrid = document.getElementById('customColors')!;
+    if (currentTheme === 'custom') {
+      colorGrid.style.display = 'grid';
+      const fields: [keyof ThemeDef, string][] = [
+        ['bg', 'Background'], ['panel', 'Panel'], ['pane', 'Terminal'], ['border', 'Border'],
+        ['text', 'Text'], ['muted', 'Muted'], ['accent', 'Accent'], ['accent2', 'Accent 2'],
+      ];
+      colorGrid.innerHTML = fields.map(([key, label]) => `
+        <label class="color-field"><span>${label}</span><input type="color" data-key="${key}" value="${THEMES.custom[key]}"></label>`).join('');
+      colorGrid.querySelectorAll('input[type=color]').forEach((inp) => {
+        inp.addEventListener('input', (e) => {
+          const target = e.target as HTMLInputElement;
+          const key = target.dataset.key as keyof ThemeDef;
+          if (key) { (THEMES.custom as unknown as Record<string, string>)[key] = target.value; applyCustomLive(); }
+        });
+      });
+    }
+
+    // Font select
+    document.getElementById('fontSelect')?.addEventListener('change', (e) => {
+      settings.font = (e.target as HTMLSelectElement).value;
+      for (const s of sessions) s.term.options.fontFamily = `'${settings.font}', monospace`;
+      activeSession?.fit();
+    });
+    // Font size
+    document.getElementById('fontSize')?.addEventListener('input', (e) => {
+      settings.fontSize = +(e.target as HTMLInputElement).value;
+      currentFont = settings.fontSize;
+      for (const s of sessions) s.setFont(settings.fontSize);
+      renderDrawer();
+    });
+    // Line height
+    document.getElementById('lineHeight')?.addEventListener('input', (e) => {
+      settings.lineHeight = +(e.target as HTMLInputElement).value;
+      for (const s of sessions) s.term.options.lineHeight = settings.lineHeight;
+      activeSession?.fit();
+      renderDrawer();
+    });
+    // Cursor style
+    document.getElementById('cursorSeg')?.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('[data-v]') as HTMLElement;
+      if (btn) {
+        settings.cursorStyle = btn.dataset.v as typeof settings.cursorStyle;
+        for (const s of sessions) s.term.options.cursorStyle = settings.cursorStyle;
+        renderDrawer();
+      }
+    });
+    // Cursor blink
+    document.getElementById('blinkSwitch')?.addEventListener('click', () => {
+      settings.cursorBlink = !settings.cursorBlink;
+      for (const s of sessions) s.term.options.cursorBlink = settings.cursorBlink;
+      renderDrawer();
+    });
+  }
+
+  if (drawerTab === 'behavior') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">General</div>
+        <div class="row"><label>Confirm before closing tab<span class="hint">Shows a dialog when closing tabs with running processes</span></label>
+          <div class="switch ${settings.confirmClose ? 'on' : ''}" id="confirmSwitch"></div>
+        </div>
+        <div class="row"><label>Bell sound<span class="hint">Beep when terminal BEL character is received</span></label>
+          <div class="switch ${settings.bellSound ? 'on' : ''}" id="bellSwitch"></div>
+        </div>
+      </div>`;
+    document.getElementById('confirmSwitch')?.addEventListener('click', () => { settings.confirmClose = !settings.confirmClose; renderDrawer(); });
+    document.getElementById('bellSwitch')?.addEventListener('click', () => { settings.bellSound = !settings.bellSound; renderDrawer(); });
+  }
+
+  if (drawerTab === 'keybinds') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">Tab & panel navigation</div>
+        <div id="kbList"></div>
+        <a class="reset-link" id="resetKb">Reset to defaults</a>
+      </div>`;
+    const list = document.getElementById('kbList')!;
+    const KB_LABELS: Record<string, [string, string]> = {
+      newTab: ['New tab', 'Open a new terminal tab'],
+      closeTab: ['Close tab', 'Close the active tab'],
+      nextTab: ['Next tab', 'Switch to the next tab'],
+      prevTab: ['Previous tab', 'Switch to the previous tab'],
+    };
+    for (const [action, [label, desc]] of Object.entries(KB_LABELS)) {
+      const row = document.createElement('div');
+      row.className = 'keybind-row';
+      row.innerHTML = `<div><div class="kb-label">${label}</div><div class="kb-desc">${desc}</div></div>
+        <button class="kb-badge" data-action="${action}">${keybinds[action]}</button>`;
+      list.appendChild(row);
+    }
+    list.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('.kb-badge') as HTMLElement;
+      if (btn) startRecording(btn, btn.dataset.action!);
+    });
+    document.getElementById('resetKb')?.addEventListener('click', () => {
+      keybinds.newTab = 'Ctrl+T';
+      keybinds.closeTab = 'Ctrl+W';
+      keybinds.nextTab = 'Ctrl+Tab';
+      keybinds.prevTab = 'Ctrl+Shift+Tab';
+      renderDrawer();
+      showToast('Keybinds reset to defaults');
+    });
+  }
+}
+
+function applyTheme(key: string): void {
+  currentTheme = key;
+  pushCssVars(THEMES[key]);
+  // Update all open terminals
+  for (const s of sessions) {
+    s.term.options.theme = XTERM_THEME as never;
+  }
+  renderDrawer();
+}
+
+function applyCustomLive(): void {
+  currentTheme = 'custom';
+  pushCssVars(THEMES.custom);
+  for (const s of sessions) {
+    s.term.options.theme = XTERM_THEME as never;
+  }
+  const card = document.getElementById('customThemeCard');
+  if (card) {
+    card.classList.add('selected');
+    const swatchBg = card.querySelector('.sw-bg') as HTMLElement | null;
+    const swatchAccent = card.querySelector('.sw-accent') as HTMLElement | null;
+    const swatchAccent2 = card.querySelector('.sw-accent2') as HTMLElement | null;
+    if (swatchBg) swatchBg.style.background = THEMES.custom.bg;
+    if (swatchAccent) swatchAccent.style.background = THEMES.custom.accent;
+    if (swatchAccent2) swatchAccent2.style.background = THEMES.custom.accent2;
+    document.querySelectorAll('.theme-card').forEach((c) => { if (c !== card) c.classList.remove('selected'); });
+  }
+}
+
+// Keybind system
+const keybinds: Record<string, string> = {
+  newTab: 'Ctrl+T',
+  closeTab: 'Ctrl+W',
+  nextTab: 'Ctrl+Tab',
+  prevTab: 'Ctrl+Shift+Tab',
+};
+
+let recordingBtn: HTMLElement | null = null;
+let recordingAction: string | null = null;
+
+function startRecording(btn: HTMLElement, action: string): void {
+  if (recordingBtn) recordingBtn.classList.remove('recording');
+  recordingBtn = btn;
+  recordingAction = action;
+  btn.textContent = 'Press a key...';
+  btn.classList.add('recording');
+}
+function stopRecording(): void {
+  if (recordingBtn) recordingBtn.classList.remove('recording');
+  recordingBtn = null;
+  recordingAction = null;
+}
+
+const ARROW: Record<string, string> = { ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→' };
+function comboFromEvent(e: KeyboardEvent): string {
+  const parts: string[] = [];
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.metaKey) parts.push('Cmd');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  const k = ARROW[e.key] || (e.key.length === 1 ? e.key.toUpperCase() : e.key);
+  if (!['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) parts.push(k);
+  return parts.join('+');
+}
+
+// Global keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  const tag = ((e as KeyboardEvent).target as HTMLElement)?.tagName?.toLowerCase() ?? '';
+  // Keybind recording mode
+  if (recordingAction) {
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+    e.preventDefault();
+    const combo = comboFromEvent(e);
+    keybinds[recordingAction] = combo;
+    showToast(`Keybind: ${combo}`);
+    stopRecording();
+    renderDrawer();
+    return;
+  }
+  if (tag === 'input' || tag === 'textarea') return;
+  const combo = comboFromEvent(e);
+  for (const [action, bound] of Object.entries(keybinds)) {
+    if (bound === combo) {
+      e.preventDefault();
+      runAction(action);
+      return;
+    }
+  }
 });
-controlsEl.append(dlBtn);
 
-makeButton(controlsEl, 'tb-btn', '⤢', 'Toggle fullscreen', toggleFullscreen);
-makeButton(controlsEl, 'tb-btn', '?', 'Help: copy / paste / files', openHelp);
+function runAction(action: string): void {
+  switch (action) {
+    case 'newTab': openNewTabModal(); break;
+    case 'closeTab': if (activeSession) confirmCloseSession(activeSession); break;
+    case 'nextTab': navigateTab(1); break;
+    case 'prevTab': navigateTab(-1); break;
+  }
+}
 
-// On-screen key bar
+function navigateTab(dir: number): void {
+  if (sessions.length < 2) return;
+  const idx = sessions.findIndex((s) => s === activeSession);
+  const next = sessions[(idx + dir + sessions.length) % sessions.length];
+  if (next) activateSession(next);
+}
+
+// ---------------------------------------------------------------------------
+// New tab modal
+// ---------------------------------------------------------------------------
+function openNewTabModal(): void {
+  newTabInput.value = nextSessionName();
+  modalOverlay.classList.add('open');
+  setTimeout(() => { newTabInput.focus(); newTabInput.select(); }, 50);
+}
+function closeModal(): void { modalOverlay.classList.remove('open'); }
+
+document.getElementById('modalCancel')?.addEventListener('click', closeModal);
+document.getElementById('modalCreate')?.addEventListener('click', confirmNewTab);
+modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+newTabInput.addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.key === 'Enter') { e.preventDefault(); confirmNewTab(); }
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(); }
+});
+
+function confirmNewTab(): void {
+  const name = newTabInput.value.trim() || nextSessionName();
+  const sanitized = sanitizeName(name) ?? name;
+  addSession(sanitized, true);
+  closeModal();
+  showToast(`Tab "${sanitized}" created`);
+}
+
+// ---------------------------------------------------------------------------
+// On-screen key bar (touch devices)
+// ---------------------------------------------------------------------------
 interface KeyDef { label?: string; seq?: string; mod?: 'ctrl' | 'alt'; action?: 'copy' | 'paste' | 'select'; rowBreak?: boolean; }
 const KEYS: KeyDef[] = [
   { label: 'Esc', seq: '\x1b' }, { label: 'Tab', seq: '\t' },
@@ -1095,6 +1419,7 @@ const KEYS: KeyDef[] = [
 let ctrlArmed = false, altArmed = false;
 const modButtons: Partial<Record<'ctrl' | 'alt', HTMLElement>> = {};
 let selectBtn: HTMLElement | null = null;
+let keysBtn: HTMLButtonElement | null = null;
 
 function refreshModVisuals(): void {
   modButtons.ctrl?.classList.toggle('armed', ctrlArmed);
@@ -1172,7 +1497,7 @@ function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElemen
   return b;
 }
 
-const mMenuBtn = mBtn('☰', 'Sessions', () => openDrawer());
+const mMenuBtn = mBtn('☰', 'Sessions', () => openMobileDrawer());
 const mTitle = document.createElement('button');
 mTitle.className = 'm-title';
 mTitle.type = 'button';
@@ -1184,7 +1509,18 @@ const mCaret = document.createElement('span');
 mCaret.className = 'm-caret';
 mCaret.textContent = '▾';
 mTitle.append(mTitleDot, mTitleLabel, mCaret);
-mTitle.addEventListener('pointerdown', (e) => { e.preventDefault(); openDrawer(); });
+mTitle.addEventListener('pointerdown', (e) => { e.preventDefault(); openMobileDrawer(); });
+
+// File attach
+const fileInput = document.createElement('input');
+fileInput.type = 'file';
+fileInput.multiple = true;
+fileInput.style.display = 'none';
+document.body.append(fileInput);
+fileInput.addEventListener('change', () => {
+  if (fileInput.files) { for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name); }
+  fileInput.value = '';
+});
 
 const mAttachBtn = document.createElement('button');
 mAttachBtn.className = 'm-btn';
@@ -1198,21 +1534,31 @@ const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
 
 mobilebar.append(mMenuBtn, mTitle, mAttachBtn, mKeysBtn, mMoreBtn);
 
-// --- Sessions drawer (bottom sheet) ---
-const drawerOverlay = document.getElementById('drawerOverlay')!;
+// Mobile sessions drawer (bottom sheet)
+const drawerOverlay = document.createElement('div');
+drawerOverlay.className = 'sheet-overlay hidden';
+const drawerSheet = document.createElement('div');
+drawerSheet.className = 'sheet';
+const drawerGrip = document.createElement('div');
+drawerGrip.className = 'sheet-grip';
+const drawerSheetTitle = document.createElement('div');
+drawerSheetTitle.className = 'sheet-title';
+drawerSheetTitle.textContent = 'Sessions';
 const drawerList = document.createElement('div');
 drawerList.className = 'drawer-list';
-const drawerNew = document.createElement('button');
-drawerNew.className = 'drawer-new';
-drawerNew.type = 'button';
-drawerNew.textContent = '+  New session';
-drawerNew.addEventListener('pointerdown', (e) => { e.preventDefault(); closeDrawer(); promptAddSession(); });
-document.getElementById('drawerBody')!.append(drawerList, drawerNew);
-drawerOverlay.addEventListener('pointerdown', (e) => { if (e.target === drawerOverlay) closeDrawer(); });
+const drawerNewBtn = document.createElement('button');
+drawerNewBtn.className = 'drawer-new';
+drawerNewBtn.type = 'button';
+drawerNewBtn.textContent = '+  New session';
+drawerNewBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); closeMobileDrawer(); openNewTabModal(); });
+drawerSheet.append(drawerGrip, drawerSheetTitle, drawerList, drawerNewBtn);
+drawerOverlay.append(drawerSheet);
+document.body.append(drawerOverlay);
+drawerOverlay.addEventListener('pointerdown', (e) => { if (e.target === drawerOverlay) closeMobileDrawer(); });
 
-let drawerOpen = false;
+let mobileDrawerOpen = false;
 
-function renderDrawerList(): void {
+function renderMobileDrawerList(): void {
   drawerList.textContent = '';
   for (const s of sessions) {
     const row = document.createElement('div');
@@ -1225,36 +1571,32 @@ function renderDrawerList(): void {
     name.className = 'drawer-name';
     name.textContent = s.displayName;
     body.append(dot, name);
-    body.addEventListener('pointerdown', (e) => { e.preventDefault(); activateSession(s); closeDrawer(); });
+    body.addEventListener('pointerdown', (e) => { e.preventDefault(); activateSession(s); closeMobileDrawer(); });
     const rename = document.createElement('button');
     rename.className = 'drawer-act';
     rename.type = 'button';
     rename.textContent = '✎';
     rename.title = 'Rename tab';
-    rename.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); promptRenameSession(s); renderDrawerList(); });
+    rename.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); promptRenameSession(s); renderMobileDrawerList(); });
     const close = document.createElement('button');
     close.className = 'drawer-act danger';
     close.type = 'button';
     close.textContent = '×';
     close.title = 'Close tab & kill session';
-    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); closeDrawer(); confirmCloseSession(s); });
+    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); closeMobileDrawer(); confirmCloseSession(s); });
     row.append(body, rename, close);
     drawerList.append(row);
   }
 }
 
-function openDrawer(): void { renderDrawerList(); drawerOverlay.classList.remove('hidden'); drawerOpen = true; }
-function closeDrawer(): void {
-  drawerOverlay.classList.add('hidden');
-  drawerOpen = false;
-  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
-}
+function openMobileDrawer(): void { renderMobileDrawerList(); drawerOverlay.classList.remove('hidden'); mobileDrawerOpen = true; }
+function closeMobileDrawer(): void { drawerOverlay.classList.add('hidden'); mobileDrawerOpen = false; }
 
-// --- Actions sheet ---
+// Mobile actions sheet
 const sheetOverlay = document.createElement('div');
 sheetOverlay.className = 'sheet-overlay hidden';
 const sheet = document.createElement('div');
-sheet.className = 'sheet actions-sheet';
+sheet.className = 'sheet';
 const sheetGrip = document.createElement('div');
 sheetGrip.className = 'sheet-grip';
 const sheetTitle = document.createElement('div');
@@ -1296,7 +1638,9 @@ sheet.append(
   sheetGrip, sheetTitle, fontRow,
   sheetRow('⟳', 'Restart this session', () => { closeSheet(); activeSession?.restart(); activeSession?.focus(); }),
   sheetRow('📋', 'Paste', () => { closeSheet(); pasteFromClipboard(); }),
+  sheetRow('⬇', 'Download file', () => { closeSheet(); void (async () => { const p = await domPrompt({ label: 'Enter file path to download', value: '~/', okText: 'Download' }); if (p) void downloadFromHost(p); })(); }),
   sheetRow('⤢', 'Toggle fullscreen', () => { closeSheet(); toggleFullscreen(); }),
+  sheetRow('⚙', 'Settings', () => { closeSheet(); openDrawer(); }),
   sheetRow('?', 'Help: copy / paste / files', () => { closeSheet(); openHelp(); }),
 );
 sheetOverlay.append(sheet);
@@ -1306,12 +1650,20 @@ sheetOverlay.addEventListener('pointerdown', (e) => { if (e.target === sheetOver
 function openSheet(): void { updateFontVal(); sheetOverlay.classList.remove('hidden'); }
 function closeSheet(): void { sheetOverlay.classList.add('hidden'); }
 
+function changeFont(delta: number): void {
+  currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
+  settings.fontSize = currentFont;
+  try { localStorage.setItem('tw.fontSize', String(currentFont)); } catch { /* ignore */ }
+  for (const s of sessions) s.setFont(currentFont);
+  activeSession?.focus();
+}
+
 function refreshMobileUI(): void {
   const s = activeSession;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
   mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
-  if (drawerOpen) renderDrawerList();
+  if (mobileDrawerOpen) renderMobileDrawerList();
 }
 
 // ---------------------------------------------------------------------------
@@ -1322,19 +1674,19 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
     if (!file) { resolve(); return; }
     const target = activeSession;
     const label = name ?? 'file';
-    showStatus(`uploading ${label}… 0%`);
+    showStatus(`uploading ${label}... 0%`);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
     xhr.upload.onprogress = (e): void => {
       if (e.lengthComputable) {
         const pct = Math.round((e.loaded / e.total) * 100);
-        showStatus(`uploading ${label}… ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`);
+        showStatus(`uploading ${label}... ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`);
       } else {
-        showStatus(`uploading ${label}… ${fmtMB(e.loaded)} MB`);
+        showStatus(`uploading ${label}... ${fmtMB(e.loaded)} MB`);
       }
     };
-    xhr.upload.onload = (): void => showStatus(`uploading ${label}… finishing…`);
+    xhr.upload.onload = (): void => showStatus(`uploading ${label}... finishing...`);
     xhr.onload = (): void => {
       let data: { path?: string; error?: string } = {};
       try { data = JSON.parse(xhr.responseText) as typeof data; } catch { /* non-JSON */ }
@@ -1344,7 +1696,7 @@ function uploadFile(file: Blob, name?: string): Promise<void> {
           target.sendSeq(p + ' ');
           if (isActive(target)) target.focus();
         }
-        const where = target && !isActive(target) ? ` → ${target.displayName}` : '';
+        const where = target && !isActive(target) ? ` -> ${target.displayName}` : '';
         flashStatus(`file added${where}: ${data.path}`, 2500);
       } else {
         flashStatus(data.error ? `upload failed: ${data.error}` : 'file upload failed', 3500);
@@ -1360,7 +1712,7 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   const p = rawPath.trim();
   if (!p) return;
   const url = '/api/download?path=' + encodeURIComponent(p);
-  showStatus(`preparing ${p}…`);
+  showStatus(`preparing ${p}...`);
   let head: Response;
   try { head = await fetch(url, { method: 'HEAD' }); } catch { flashStatus('download failed (network)', 2500); return; }
   if (!head.ok) {
@@ -1376,7 +1728,7 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   document.body.append(a);
   a.click();
   a.remove();
-  flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}…`, 2500);
+  flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}...`, 2500);
 }
 
 // Paste / drag-drop file handling
@@ -1416,16 +1768,17 @@ function dragHasFile(dt: DataTransfer | null): boolean {
   for (let i = 0; i < dt.items.length; i += 1) { if (dt.items[i].kind === 'file') return true; }
   return false;
 }
-termArea.addEventListener('dragover', (e) => {
-  if (!dragHasFile(e.dataTransfer)) return;
+const workspaceEl = document.querySelector('.workspace') as HTMLElement;
+workspaceEl?.addEventListener('dragover', (e) => {
+  if (!dragHasFile((e as DragEvent).dataTransfer)) return;
   e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-  termArea.classList.add('dragging');
+  if ((e as DragEvent).dataTransfer) (e as DragEvent).dataTransfer!.dropEffect = 'copy';
+  workspaceEl.classList.add('dragging');
 });
-termArea.addEventListener('dragleave', () => termArea.classList.remove('dragging'));
-termArea.addEventListener('drop', (e) => {
-  termArea.classList.remove('dragging');
-  const files = e.dataTransfer?.files;
+workspaceEl?.addEventListener('dragleave', () => workspaceEl.classList.remove('dragging'));
+workspaceEl?.addEventListener('drop', (e) => {
+  workspaceEl.classList.remove('dragging');
+  const files = (e as DragEvent).dataTransfer?.files;
   if (!files || files.length === 0) return;
   e.preventDefault();
   for (const f of Array.from(files)) void uploadFile(f, f.name);
@@ -1464,19 +1817,19 @@ try { if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700)
 
 window.addEventListener('resize', () => { updateKeybarHeight(); fitActive(); });
 mobileMQ.addEventListener('change', () => { updateKeybarHeight(); fitActive(); });
-if (typeof ResizeObserver !== 'undefined') { const areaObserver = new ResizeObserver(() => fitActive()); areaObserver.observe(termArea); }
+if (typeof ResizeObserver !== 'undefined') { const areaObserver = new ResizeObserver(() => fitActive()); areaObserver.observe(paneGrid); }
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', updateKeyboardOffset);
   window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
   if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
 }
 window.addEventListener('beforeunload', () => { for (const s of sessions) s.dispose(); });
+
 // Apply initial theme
 pushCssVars(THEMES.aurora);
-
 
 // Simulate reconnect -> connected on first load
 connDot.classList.add('reconnecting');
 connDot.style.background = '#f0b429';
-connLabel.textContent = 'reconnecting…';
+connLabel.textContent = 'reconnecting...';
 setTimeout(() => { connDot.classList.remove('reconnecting'); connDot.style.background = '#86efac'; connLabel.textContent = 'connected'; }, 1200);
