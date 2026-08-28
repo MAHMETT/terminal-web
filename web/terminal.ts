@@ -11,55 +11,28 @@ const MIN_DELAY = 500;
 const MAX_DELAY = 5000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
-const KEYBAR_HEIGHT = 48; // px when shown
+const KEYBAR_HEIGHT = 48;
 
-// Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
-// a finger drag is normally hijacked for scrolling and there is no way to make a
-// text selection by touch (on desktop you hold Option to bypass tmux's mouse
-// reporting; a tablet has no such key). While this is on, a one-finger drag
-// selects text instead of scrolling, and lifting the finger copies it.
 let touchSelectMode = false;
-// Window to drop a duplicated IME emission. The CapsLock-switch double-send
-// arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
-// 100ms was just too tight; 300ms covers it with margin while staying far below
-// the interval of any legitimate re-typing of the same characters.
 const IME_DEDUP_MS = 300;
-
-// Cap on the bytes of discrete injections (uploaded file path, paste, key-bar
-// press) buffered while the WebSocket is down, so a long outage can't grow the
-// queue without bound. 64 KB is far more than any real path/paste.
 const MAX_PENDING_SEQ = 64 * 1024;
-
-// macOS uses ⌘ for copy/paste (never a terminal control key), so xterm passes
-// it through to the browser. Everything else uses Ctrl, which collides with the
-// terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
-// ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
-// the server log via the same WS debug channel, for on-device layout diagnosis.
 const VV_DEBUG = (params.get('debug') ?? '').includes('vv');
-// ?debug=paste logs what each paste event actually carries (clipboard types,
-// item kinds/types, file count) — for diagnosing why image paste-to-upload
-// behaves differently across browsers/OSes (e.g. Windows Chrome).
 const PASTE_DEBUG = (params.get('debug') ?? '').includes('paste');
-// WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
-// renderer — useful for flaky GPUs or headless capture.
 const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
-
 const encoder = new TextEncoder();
+const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 
-/** Sanitize a session name to [A-Za-z0-9_-]{1,64}; null if nothing usable. */
 function sanitizeName(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
   const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
   return cleaned.length ? cleaned : null;
 }
 
-// Copy text to the clipboard. Uses the async Clipboard API on a secure context
-// (HTTPS), else falls back to a hidden-textarea + execCommand("copy"), which
-// works over plain HTTP within a user gesture.
+
 async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
   try {
@@ -67,9 +40,7 @@ async function copyText(text: string): Promise<boolean> {
       await navigator.clipboard.writeText(text);
       return true;
     }
-  } catch {
-    /* fall through to the legacy path */
-  }
+  } catch { /* fall through */ }
   try {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -81,36 +52,18 @@ async function copyText(text: string): Promise<boolean> {
     const ok = document.execCommand('copy');
     ta.remove();
     return ok;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-// Read the clipboard and send it to the active session. Reading requires a
-// secure context (HTTPS); over HTTP we can't, so hint the user to use Cmd/Ctrl-V
-// (the native paste event still works when the terminal is focused).
 function pasteFromClipboard(): void {
   const clip = navigator.clipboard;
   if (clip && typeof clip.readText === 'function' && window.isSecureContext) {
-    clip
-      .readText()
-      .then((t) => {
-        if (t) activeSession?.sendSeq(t);
-        else openPasteBox();
-      })
-      .catch(() => openPasteBox());
+    clip.readText().then((t) => { if (t) activeSession?.sendSeq(t); else openPasteBox(); }).catch(() => openPasteBox());
   } else {
-    // Plain HTTP can't read the clipboard via JS, so pop a box the user pastes
-    // into (native paste into a real textarea works on HTTP and iPad).
     openPasteBox();
   }
 }
 
-// Rich paste for the Windows/Linux Ctrl+Shift+V chord: unlike Chrome's built-in
-// "paste as plain text" (which drops images) or readText() (text only), the
-// async Clipboard API returns BOTH text and image blobs — so a pasted image
-// uploads and text goes to the shell. Falls back to the text-only path when the
-// Clipboard read API isn't available (non-secure context / older browsers).
 async function pasteRich(): Promise<void> {
   const clip = navigator.clipboard;
   if (clip && typeof clip.read === 'function' && window.isSecureContext) {
@@ -131,15 +84,11 @@ async function pasteRich(): Promise<void> {
         }
       }
       if (handled) return;
-    } catch {
-      /* permission denied / not focused — fall back to the legacy paths */
-    }
+    } catch { /* permission denied / not focused */ }
   }
   pasteFromClipboard();
 }
 
-// A small overlay with a real <textarea> the user pastes into, then we forward
-// the text to the active session. Works without the Clipboard API (HTTP/iPad).
 function openPasteBox(): void {
   if (document.querySelector('.paste-overlay')) return;
   const overlay = document.createElement('div');
@@ -148,20 +97,20 @@ function openPasteBox(): void {
   box.className = 'paste-box';
   const label = document.createElement('div');
   label.className = 'paste-label';
-  label.textContent = `Paste here (${isMac ? '⌘V' : 'Ctrl+V'} / long-press → Paste) — sends automatically`;
+  label.textContent = `Paste here (${isMac ? '⌘V' : 'Ctrl+V'}) — sends automatically`;
   const ta = document.createElement('textarea');
   ta.className = 'paste-ta';
-  ta.setAttribute('autocapitalize', 'off');
-  ta.setAttribute('autocomplete', 'off');
+  ta.autocapitalize = 'off';
+  ta.autocomplete = 'off';
   ta.spellcheck = false;
   const row = document.createElement('div');
   row.className = 'paste-row';
   const cancel = document.createElement('button');
-  cancel.className = 'tb-btn';
+  cancel.className = 'btn btn-ghost';
   cancel.type = 'button';
   cancel.textContent = 'Cancel';
   const send = document.createElement('button');
-  send.className = 'tb-btn';
+  send.className = 'btn btn-primary';
   send.type = 'button';
   send.textContent = 'Send';
   row.append(cancel, send);
@@ -169,32 +118,17 @@ function openPasteBox(): void {
   overlay.append(box);
   document.body.append(overlay);
   window.setTimeout(() => ta.focus(), 0);
-
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
-  const submit = (): void => {
-    const t = ta.value;
-    if (t) activeSession?.sendSeq(t);
-    close();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
+  const submit = (): void => { const t = ta.value; if (t) activeSession?.sendSeq(t); close(); };
   send.addEventListener('click', submit);
   cancel.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  // One-tap feel: auto-send right after a paste lands in the box.
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   ta.addEventListener('paste', () => window.setTimeout(submit, 0));
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-  });
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 }
 
-// Quick help overlay: how to copy / paste / attach files. Shown from the "?"
-// button and once automatically on first visit.
 function openHelp(): void {
-  if (document.querySelector('.help-overlay')) return;
+  if (document.querySelector('.paste-overlay')) return;
   const selKey = isMac ? '⌥ Option' : 'Shift';
   const pasteKey = isMac ? '⌘V' : 'Ctrl+Shift+V';
   const copyKey = isMac ? '⌘C' : 'Ctrl+Shift+C';
@@ -205,88 +139,88 @@ function openHelp(): void {
   box.innerHTML =
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
-    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
-    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
-    '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
-    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host (e.g. <code>~/output/report.zip</code>); it downloads to this device. Tip: run <code>realpath &lt;file&gt;</code> in the terminal to get the path.</li>' +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b>.)</li>` +
+    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box.</li>` +
+    '<li><b>Attach a file</b> — tap the 📎 button, or paste / drag any file: it uploads and inserts the file path.</li>' +
+    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
-    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
+    '<li><b>Tabs</b> — <b>+</b> new session, drag to reorder, <b>×</b> closes the tab and kills its session.</li>' +
     '</ul>' +
-    '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
+    '<div class="paste-row"><button class="btn btn-ghost" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
   document.body.append(overlay);
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
   box.querySelector('[data-help-close]')?.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  try {
-    localStorage.setItem('tw.helpSeen', '1');
-  } catch {
-    /* ignore */
-  }
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  try { localStorage.setItem('tw.helpSeen', '1'); } catch { /* ignore */ }
 }
 
-const THEME = {
-  background: '#1e1e1e',
-  foreground: '#d4d4d4',
-  cursor: '#d4d4d4',
-  cursorAccent: '#1e1e1e',
-  selectionBackground: '#264f78',
-  black: '#000000',
-  red: '#cd3131',
-  green: '#0dbc79',
-  yellow: '#e5e510',
-  blue: '#2472c8',
-  magenta: '#bc3fbc',
-  cyan: '#11a8cd',
-  white: '#e5e5e5',
-  brightBlack: '#666666',
-  brightRed: '#f14c4c',
-  brightGreen: '#23d18b',
-  brightYellow: '#f5f543',
-  brightBlue: '#3b8eea',
-  brightMagenta: '#d670d6',
-  brightCyan: '#29b8db',
-  brightWhite: '#ffffff',
+// ---------------------------------------------------------------------------
+// Theme system
+// ---------------------------------------------------------------------------
+interface ThemeDef { name: string; bg: string; panel: string; pane: string; paneAlt: string; border: string; borderSoft: string; text: string; muted: string; dim: string; accent: string; accent2: string; }
+const THEMES: Record<string, ThemeDef> = {
+  aurora:  { name: 'Graphite Aurora', bg: '#14161b', panel: '#1a1d24', pane: '#101217', paneAlt: '#0d0f13', border: '#262b34', borderSoft: '#1f232b', text: '#e7e9ee', muted: '#8a90a0', dim: '#565c6a', accent: '#5eead4', accent2: '#a78bfa' },
+  nord:    { name: 'Nord Mist',       bg: '#1b2028', panel: '#212734', pane: '#171b22', paneAlt: '#141820', border: '#2c3341', borderSoft: '#242a36', text: '#e3e8f0', muted: '#7f8ba1', dim: '#565f70', accent: '#7fb2f0', accent2: '#f0a37f' },
+  solaris: { name: 'Solaris Light',   bg: '#f6f5f1', panel: '#ffffff', pane: '#fbfaf7', paneAlt: '#f1efe9', border: '#e2e0d8', borderSoft: '#ebe9e2', text: '#2a2b28', muted: '#7a7972', dim: '#a4a297', accent: '#1f8a70', accent2: '#b5533c' },
+  ink:     { name: 'Mono Ink',        bg: '#121212', panel: '#181818', pane: '#0e0e0e', paneAlt: '#0a0a0a', border: '#262626', borderSoft: '#1e1e1e', text: '#eaeaea', muted: '#8f8f8f', dim: '#5a5a5a', accent: '#f5f5f5', accent2: '#9a9a9a' },
+};
+function pushCssVars(t: ThemeDef): void {
+  const r = document.documentElement.style;
+  r.setProperty('--bg', t.bg);
+  r.setProperty('--panel', t.panel);
+  r.setProperty('--pane', t.pane);
+  r.setProperty('--pane-alt', t.paneAlt);
+  r.setProperty('--border', t.border);
+  r.setProperty('--border-soft', t.borderSoft);
+  r.setProperty('--text', t.text);
+  r.setProperty('--muted', t.muted);
+  r.setProperty('--dim', t.dim);
+  r.setProperty('--accent', t.accent);
+  r.setProperty('--accent2', t.accent2);
+  r.setProperty('--accent-soft', t.accent + '24');
+  // Update xterm theme to match
+  XTERM_THEME.background = t.pane;
+  XTERM_THEME.foreground = t.text;
+  XTERM_THEME.cursor = t.accent;
+  XTERM_THEME.cursorAccent = t.pane;
+  XTERM_THEME.selectionBackground = t.accent;
+}
+
+
+// xterm theme (starts with aurora; pushed by applyTheme)
+const XTERM_THEME: Record<string, string> = {
+  background: '#101217',
+  foreground: '#e7e9ee',
+  cursor: '#5eead4',
+  cursorAccent: '#101217',
+  selectionBackground: '#5eead4',
+  black: '#000000', red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
+  blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd', white: '#e5e5e5',
+  brightBlack: '#666666', brightRed: '#f14c4c', brightGreen: '#23d18b',
+  brightYellow: '#f5f543', brightBlue: '#3b8eea', brightMagenta: '#d670d6',
+  brightCyan: '#29b8db', brightWhite: '#ffffff',
 };
 
-const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-
 // ---------------------------------------------------------------------------
-// DOM
+// DOM refs
 // ---------------------------------------------------------------------------
 const root = document.documentElement;
-const topbar = document.getElementById('topbar') as HTMLElement;
-const termArea = document.getElementById('terminal') as HTMLElement;
-const keybarEl = document.getElementById('keybar') as HTMLElement;
+const termArea = document.getElementById('terminal')!;
+const keybarEl = document.getElementById('keybar')!;
 const statusEl = document.getElementById('status');
+const tabsEl = document.getElementById('tabs')!;
+const controlsEl = document.getElementById('controls')!;
 
-// Top bar layout: [ tabs (scrollable) ... + ] [ controls ]
-const tabsEl = document.createElement('div');
-tabsEl.id = 'tabs';
-const addBtn = document.createElement('button');
-addBtn.className = 'tab-add';
-addBtn.type = 'button';
-addBtn.textContent = '+';
-addBtn.title = 'New session';
-tabsEl.append(addBtn);
-
-const controlsEl = document.createElement('div');
-controlsEl.id = 'controls';
-
-topbar.append(tabsEl, controlsEl);
+const connDot = document.getElementById('connDot')!;
+const connLabel = document.getElementById('connLabel')!;
+const layoutLabel = document.getElementById('layoutLabel')!;
 
 let currentFont = (() => {
   try {
     const n = parseInt(localStorage.getItem('tw.fontSize') ?? '', 10);
     if (!Number.isNaN(n)) return Math.min(MAX_FONT, Math.max(MIN_FONT, n));
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return 14;
 })();
 
@@ -295,19 +229,18 @@ function showStatus(text: string): void {
   statusEl.textContent = text;
   statusEl.classList.add('visible');
 }
-function hideStatus(): void {
-  statusEl?.classList.remove('visible');
+function hideStatus(): void { statusEl?.classList.remove('visible'); }
+function flashStatus(text: string, ms: number): void {
+  showStatus(text);
+  window.setTimeout(() => { if (statusEl?.textContent === text) hideStatus(); }, ms);
 }
+function fmtMB(bytes: number): string { return (bytes / (1024 * 1024)).toFixed(1); }
 
 // ---------------------------------------------------------------------------
-// Session: one terminal + one WebSocket + reconnect, rendered in its own pane.
+// Session class — one real terminal per tmux session
 // ---------------------------------------------------------------------------
 class Session {
-  // Immutable tmux session id — used for the WebSocket ?session= param and the
-  // kill command. Renaming a tab never touches this, so × still kills the
-  // original session.
   readonly name: string;
-  // Mutable label shown on the tab; defaults to the session name.
   displayName: string;
   readonly term: Terminal;
   readonly el: HTMLElement;
@@ -315,10 +248,6 @@ class Session {
   tabLabel: HTMLElement | null = null;
   tabDot: HTMLElement | null = null;
   connected = false;
-  // True once the socket has opened at least once — i.e. the server has seen
-  // (and registered) this session. The cross-device sync only ever removes
-  // sessions that have connected, so a brand-new tab mid-connect is never
-  // mistaken for one closed elsewhere.
   everConnected = false;
 
   private readonly fitAddon = new FitAddon();
@@ -327,22 +256,10 @@ class Session {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
-
-  // IME double-input guard (order-independent, content-scoped).
   private lastData = '';
   private lastDataAt = 0;
-
-  // True between compositionstart and compositionend — i.e. while the soft
-  // keyboard is mid-composition (e.g. picking a 注音 candidate). A reconnect
-  // that re-fits/re-focuses the terminal during this window cancels the iOS
-  // composition (the candidate bar vanishes, input turns raw/direct), so we
-  // defer that re-attach work until the composition commits.
   private composing = false;
   private reattachAfterCompose = false;
-
-  // Discrete injections (file path, paste, key-bar seq) buffered while the WS is
-  // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
-  // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
 
   constructor(name: string, displayName?: string) {
@@ -350,75 +267,42 @@ class Session {
     this.displayName = displayName?.trim() || name;
     this.term = new Terminal({
       cursorBlink: true,
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: currentFont,
       scrollback: 100000,
       allowProposedApi: true,
-      // Hold Option (macOS) / Shift (others) and drag to select text even while
-      // tmux mouse mode is on, so it can be copied.
       macOptionClickForcesSelection: true,
-      theme: THEME,
+      theme: XTERM_THEME as never,
     });
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
-
     this.el = document.createElement('div');
     this.el.className = 'term-pane hidden';
     termArea.append(this.el);
     this.term.open(this.el);
-
     if (WEBGL_ENABLED) {
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        this.term.loadAddon(webgl);
-      } catch {
-        /* fall back to the DOM renderer */
-      }
+      try { const webgl = new WebglAddon(); webgl.onContextLoss(() => webgl.dispose()); this.term.loadAddon(webgl); } catch { /* fallback */ }
     }
-
-    // Windows/Linux copy-paste. Ctrl+C / Ctrl+V collide with the terminal's own
-    // interrupt (^C) and literal (^V): xterm maps them to control bytes and
-    // cancels the keydown, which ALSO suppresses the browser's native copy/paste
-    // and the paste-to-upload event — so on Windows nothing copies, pastes, or
-    // uploads. macOS avoids this because ⌘ is never a terminal key. So on
-    // non-Mac, wire the Ctrl+Shift+C / Ctrl+Shift+V chords explicitly (as VS
-    // Code / Hyper do): copy the selection (and stop Chrome opening DevTools on
-    // Ctrl+Shift+C), and rich-paste text + images. Plain Ctrl+C stays ^C/SIGINT.
     if (!isMac) {
       this.term.attachCustomKeyEventHandler((e) => {
-        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) {
-          return true; // not a copy/paste chord — let xterm handle it normally
-        }
+        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return true;
         if (e.code === 'KeyC') {
           const sel = this.term.getSelection();
           if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
           else flashStatus('nothing selected', 1200);
-          e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
-          return false; // handled — don't let xterm process it
-        }
-        if (e.code === 'KeyV') {
-          e.preventDefault(); // we paste via the Clipboard API, not the browser default
-          void pasteRich();
+          e.preventDefault();
           return false;
         }
+        if (e.code === 'KeyV') { e.preventDefault(); void pasteRich(); return false; }
         return true;
       });
     }
-
-    // Copy the selection to the clipboard when a drag/touch selection ends.
     const copySelection = (): void => {
       const sel = this.term.getSelection();
-      if (sel) {
-        void copyText(sel).then((ok) => {
-          if (ok) flashStatus('copied', 1200);
-        });
-      }
+      if (sel) void copyText(sel).then((ok) => { if (ok) flashStatus('copied', 1200); });
     };
     this.el.addEventListener('mouseup', copySelection);
     this.el.addEventListener('touchend', copySelection);
-
     this.wireInput();
     this.wireTouchScroll();
     this.connect();
@@ -428,104 +312,52 @@ class Session {
     if (!IME_DEBUG) return;
     this.debugSend(event, data);
   }
-
-  /** Ungated debug sender — callers gate on their own flag (IME_DEBUG / VV_DEBUG). */
   debugSend(event: string, data?: string): void {
-    // eslint-disable-next-line no-console
     console.log('[ime]', this.name, event, JSON.stringify(data ?? ''));
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(
-        JSON.stringify({
-          type: 'debug',
-          event,
-          data: String(data ?? ''),
-          at: Math.round(performance.now()),
-        }),
-      );
+      this.ws.send(JSON.stringify({ type: 'debug', event, data: String(data ?? ''), at: Math.round(performance.now()) }));
     }
   }
 
   private wireInput(): void {
     const ta = this.term.textarea;
     if (IME_DEBUG && ta) {
-      for (const ev of ['compositionstart', 'compositionupdate', 'compositionend']) {
+      for (const ev of ['compositionstart', 'compositionupdate', 'compositionend'] as const) {
         ta.addEventListener(ev, (e) => this.debug(ev, (e as CompositionEvent).data));
       }
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
-        if (ke.isComposing || ke.keyCode === 229 || ke.keyCode === 20) {
-          this.debug('keydown', `${ke.key}/${ke.keyCode}`);
-        }
+        if (ke.isComposing || ke.keyCode === 229 || ke.keyCode === 20) this.debug('keydown', `${ke.key}/${ke.keyCode}`);
       });
     }
-
-    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
-    // keyCode 229 and the character in .key, but with NO composition and NO
-    // input event — so xterm.js drops them (in Chinese mode those keys did
-    // nothing). A real composition key (Bopomofo / pinyin letter) is also
-    // keyCode 229 but is followed by compositionstart within a few ms. So on
-    // such a keydown we schedule the character, cancel it if a composition
-    // starts, and otherwise forward it. English keys (real keyCode) and
-    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
     if (ta) {
       const pendingKeys = new Map<number, string>();
       let lastSeq = -1;
       let seq = 0;
-      // Any composition activity means the most-recent IME keydown was actually
-      // composition input (Bopomofo / pinyin), so cancel its pending forward.
-      // The truly-dropped keys (punctuation / number / space) produce no
-      // composition event at all, so their forward survives and fires.
-      const cancelLast = (): void => {
-        if (lastSeq >= 0) {
-          pendingKeys.delete(lastSeq);
-          lastSeq = -1;
-        }
-      };
-      ta.addEventListener('compositionstart', () => {
-        this.composing = true;
-        cancelLast();
-      });
+      const cancelLast = (): void => { if (lastSeq >= 0) { pendingKeys.delete(lastSeq); lastSeq = -1; } };
+      ta.addEventListener('compositionstart', () => { this.composing = true; cancelLast(); });
       ta.addEventListener('compositionupdate', cancelLast);
       ta.addEventListener('compositionend', () => {
         this.composing = false;
         cancelLast();
-        // A reconnect arrived mid-composition and deferred its re-fit/re-focus
-        // (see connect's onopen) so it wouldn't cancel the composition; now that
-        // we've committed, it's safe to catch up.
-        if (this.reattachAfterCompose) {
-          this.reattachAfterCompose = false;
-          this.fit();
-          if (isActive(this)) this.term.focus();
-        }
+        if (this.reattachAfterCompose) { this.reattachAfterCompose = false; this.fit(); if (isActive(this)) this.term.focus(); }
       });
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
-        if (ke.keyCode !== 229) return; // only IME-routed keys
+        if (ke.keyCode !== 229) return;
         const k = ke.key;
-        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
+        if (!k || k.length !== 1) return;
         const s = ++seq;
         pendingKeys.set(s, k);
         lastSeq = s;
-        window.setTimeout(() => {
-          if (!pendingKeys.has(s)) return; // a composition consumed it
-          pendingKeys.delete(s);
-          this.debug('forward-key', k);
-          this.send(k);
-        }, 90);
+        window.setTimeout(() => { if (!pendingKeys.has(s)) return; pendingKeys.delete(s); this.debug('forward-key', k); this.send(k); }, 90);
       });
     }
-
     this.term.onData((data: string) => {
       this.debug('onData', data);
       const now = performance.now();
-      // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
-      if (
-        // oxlint-disable-next-line no-control-regex
-        /[^\x00-\x7F]/.test(data) &&
-        data === this.lastData &&
-        now - this.lastDataAt < IME_DEDUP_MS
-      ) {
-        this.lastData = ''; // suppress exactly one duplicate
+      if (/[^\x00-\x7F]/.test(data) && data === this.lastData && now - this.lastDataAt < IME_DEDUP_MS) {
+        this.lastData = '';
         this.debug('onData-DROP', data);
         return;
       }
@@ -536,161 +368,70 @@ class Session {
   }
 
   private send(data: string): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(encoder.encode(data));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(encoder.encode(data));
   }
 
-  /**
-   * Send a discrete injection (key-bar sequence, paste, uploaded file path).
-   * Unlike raw keystrokes, these are buffered and replayed on reconnect when the
-   * socket is down — a big upload can saturate the uplink, trip the 20s
-   * heartbeat, and land the path insert mid-reconnect, which would otherwise be
-   * silently dropped by send() and leave the path un-pasted.
-   */
   sendSeq(seq: string): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.send(seq);
-      return;
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) { this.send(seq); return; }
     const buffered = this.pendingSeq.reduce((n, s) => n + s.length, 0);
     if (buffered + seq.length <= MAX_PENDING_SEQ) this.pendingSeq.push(seq);
   }
 
-  // One-finger touch scrolling. tmux runs in the alternate screen (no
-  // xterm-local scrollback) with `mouse on`, so history is browsed via
-  // copy-mode, which is normally driven by the mouse wheel. A phone has no
-  // wheel, so we translate a one-finger vertical drag into SGR mouse-wheel
-  // events sent to tmux — dragging down scrolls back through history, dragging
-  // up returns toward the live prompt, just like a real wheel.
   private wireTouchScroll(): void {
-    const STEP = 22; // px of drag per wheel "tick"
-    let startX = 0;
-    let startY = 0;
-    let lastY = 0;
-    let col = 1;
-    let row = 1;
-    let tracking = false;
-    let scrolling = false;
-
-    // Touch-select state (only used while touchSelectMode is on). Anchor is the
-    // 0-based cell where the drag started, in absolute buffer coords (so it
-    // stays correct even when the view is scrolled into the scrollback).
-    let selecting = false;
-    let selMoved = false;
-    let anchorCol = 0;
-    let anchorRow = 0;
-    let cellW = 1;
-    let cellH = 1;
-    let rectLeft = 0;
-    let rectTop = 0;
-
-    // Map a touch point to a 0-based [col, absoluteRow] cell.
-    const cellAt = (clientX: number, clientY: number): [number, number] => {
-      const c = Math.max(0, Math.min(this.term.cols - 1, Math.floor((clientX - rectLeft) / cellW)));
-      const r = Math.max(0, Math.min(this.term.rows - 1, Math.floor((clientY - rectTop) / cellH)));
+    const STEP = 22;
+    let startX = 0, startY = 0, lastY = 0, col = 1, row = 1, tracking = false, scrolling = false;
+    let selecting = false, selMoved = false, anchorCol = 0, anchorRow = 0, cellW = 1, cellH = 1, rectLeft = 0, rectTop = 0;
+    const cellAt = (cx: number, cy: number): [number, number] => {
+      const c = Math.max(0, Math.min(this.term.cols - 1, Math.floor((cx - rectLeft) / cellW)));
+      const r = Math.max(0, Math.min(this.term.rows - 1, Math.floor((cy - rectTop) / cellH)));
       return [c, this.term.buffer.active.viewportY + r];
     };
-
-    this.el.addEventListener(
-      'touchstart',
-      (e: TouchEvent) => {
-        if (e.touches.length !== 1) {
-          tracking = false;
-          selecting = false;
-          return;
-        }
-        const t = e.touches[0];
-        startX = t.clientX;
-        startY = lastY = t.clientY;
-        const rect = this.el.getBoundingClientRect();
-        cellW = rect.width / Math.max(1, this.term.cols);
-        cellH = rect.height / Math.max(1, this.term.rows);
-        rectLeft = rect.left;
-        rectTop = rect.top;
-        if (touchSelectMode) {
-          // Begin a selection drag; suspend scrolling for this gesture.
-          tracking = false;
-          selecting = true;
-          selMoved = false;
-          [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
-          this.term.clearSelection();
-          return;
-        }
-        tracking = true;
-        scrolling = false;
-        // Cell under the finger, so tmux targets the right pane if it's split.
-        col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
-        row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
-      },
-      { capture: true, passive: true },
-    );
-
-    this.el.addEventListener(
-      'touchmove',
-      (e: TouchEvent) => {
-        if (e.touches.length !== 1) return;
-        const t = e.touches[0];
-        if (selecting) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (!selMoved && Math.abs(t.clientX - startX) < 6 && Math.abs(t.clientY - startY) < 6) {
-            return; // ignore jitter until it's clearly a drag
-          }
-          selMoved = true;
-          let [sCol, sRow] = [anchorCol, anchorRow];
-          let [eCol, eRow] = cellAt(t.clientX, t.clientY);
-          // Order start-before-end so the length is positive whichever way you drag.
-          if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
-            [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
-          }
-          const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
-          this.term.select(sCol, sRow, length);
-          return;
-        }
-        if (!tracking) return;
-        if (!scrolling) {
-          const dyTotal = t.clientY - startY;
-          const dxTotal = t.clientX - startX;
-          // Only hijack once the gesture is clearly a vertical drag, so taps
-          // (focus / move cursor) and horizontal gestures still reach xterm.
-          if (Math.abs(dyTotal) < 10 || Math.abs(dyTotal) <= Math.abs(dxTotal)) return;
-          scrolling = true;
-        }
-        e.preventDefault();
-        e.stopPropagation();
-        let dy = t.clientY - lastY;
-        let ticks = 0;
-        while (Math.abs(dy) >= STEP) {
-          if (dy > 0) {
-            ticks += 1; // finger down → scroll back (wheel up)
-            dy -= STEP;
-          } else {
-            ticks -= 1; // finger up → toward the live prompt (wheel down)
-            dy += STEP;
-          }
-        }
-        lastY = t.clientY - dy; // carry the sub-step remainder
-        if (ticks !== 0) this.sendWheel(ticks, col, row);
-      },
-      { capture: true, passive: false },
-    );
-
-    // Copy a finished touch selection. The bubble-phase `copySelection` handler
-    // (wired in the constructor) copies term.getSelection() on touchend, so a
-    // moved selection lands on the clipboard automatically; a tap with no drag
-    // left the selection cleared, so nothing is copied. Select mode stays armed
-    // until toggled off again.
-    const end = (): void => {
-      tracking = false;
-      scrolling = false;
-      selecting = false;
-    };
+    this.el.addEventListener('touchstart', (e: TouchEvent) => {
+      if (e.touches.length !== 1) { tracking = false; selecting = false; return; }
+      const t = e.touches[0];
+      startX = t.clientX; startY = lastY = t.clientY;
+      const rect = this.el.getBoundingClientRect();
+      cellW = rect.width / Math.max(1, this.term.cols);
+      cellH = rect.height / Math.max(1, this.term.rows);
+      rectLeft = rect.left; rectTop = rect.top;
+      if (touchSelectMode) { tracking = false; selecting = true; selMoved = false; [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY); this.term.clearSelection(); return; }
+      tracking = true; scrolling = false;
+      col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
+      row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
+    }, { capture: true, passive: true });
+    this.el.addEventListener('touchmove', (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      if (selecting) {
+        e.preventDefault(); e.stopPropagation();
+        if (!selMoved && Math.abs(t.clientX - startX) < 6 && Math.abs(t.clientY - startY) < 6) return;
+        selMoved = true;
+        let [sCol, sRow] = [anchorCol, anchorRow];
+        let [eCol, eRow] = cellAt(t.clientX, t.clientY);
+        if (eRow < sRow || (eRow === sRow && eCol < sCol)) [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
+        const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
+        this.term.select(sCol, sRow, length);
+        return;
+      }
+      if (!tracking) return;
+      if (!scrolling) {
+        const dyTotal = t.clientY - startY;
+        const dxTotal = t.clientX - startX;
+        if (Math.abs(dyTotal) < 10 || Math.abs(dyTotal) <= Math.abs(dxTotal)) return;
+        scrolling = true;
+      }
+      e.preventDefault(); e.stopPropagation();
+      let dy = t.clientY - lastY;
+      let ticks = 0;
+      while (Math.abs(dy) >= STEP) { if (dy > 0) { ticks += 1; dy -= STEP; } else { ticks -= 1; dy += STEP; } }
+      lastY = t.clientY - dy;
+      if (ticks !== 0) this.sendWheel(ticks, col, row);
+    }, { capture: true, passive: false });
+    const end = (): void => { tracking = false; scrolling = false; selecting = false; };
     this.el.addEventListener('touchend', end, { capture: true, passive: true });
     this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
   }
 
-  // Emit |ticks| SGR mouse-wheel events (Cb 64 = up, 65 = down; press-only).
   private sendWheel(ticks: number, col: number, row: number): void {
     const seq = `\x1b[<${ticks > 0 ? 64 : 65};${col};${row}M`;
     for (let i = Math.abs(ticks); i > 0; i -= 1) this.send(seq);
@@ -698,96 +439,63 @@ class Session {
 
   private sendResize(): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(
-        JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }),
-      );
+      this.ws.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }));
     }
   }
 
   fit(): void {
-    if (this.el.classList.contains('hidden')) return; // don't fit a hidden pane
-    try {
-      this.fitAddon.fit();
-    } catch {
-      /* not laid out yet */
-    }
+    if (this.el.classList.contains('hidden')) return;
+    try { this.fitAddon.fit(); } catch { /* not laid out yet */ }
     this.sendResize();
   }
 
-  setFont(px: number): void {
-    this.term.options.fontSize = px;
-    this.fit();
-  }
+  setFont(px: number): void { this.term.options.fontSize = px; this.fit(); }
 
   setActive(active: boolean): void {
     this.el.classList.toggle('hidden', !active);
     if (active) {
       requestAnimationFrame(() => {
         this.fit();
-        // On touch (phones / iOS PWA), don't auto-focus the terminal when a
-        // session becomes active: focusing xterm's hidden textarea pops up the
-        // soft keyboard, so every tab switch forced the keyboard open and the
-        // user had to dismiss it each time. Skip the programmatic focus on a
-        // coarse pointer — tapping the terminal still focuses it (and raises the
-        // keyboard) when the user actually wants to type. Desktop keeps the
-        // immediate focus so you can type right after switching.
         if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
       });
     }
   }
 
-  focus(): void {
-    this.term.focus();
-  }
+  focus(): void { this.term.focus(); }
 
   restart(): void {
     this.term.reset();
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'restart' }));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'restart' }));
   }
 
-  // Ask the server to kill this tmux session for good (used on tab close).
   kill(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'kill' }));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'kill' }));
   }
 
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping' }));
-      }
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ping' }));
     }, 20000);
   }
-  private stopPing(): void {
-    if (this.pingTimer !== null) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
-  }
+  private stopPing(): void { if (this.pingTimer !== null) { clearInterval(this.pingTimer); this.pingTimer = null; } }
 
   private setConnected(state: boolean): void {
     this.connected = state;
     updateTabDot(this);
-    if (isActive(this)) reflectActiveStatus();
+    if (isActive(this)) {
+      reflectActiveStatus();
+      updateStatusBar();
+    }
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed) return;
-    if (this.reconnectTimer !== null) return;
+    if (this.disposed || this.reconnectTimer !== null) return;
     if (isActive(this)) showStatus('reconnecting…');
     const base = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_DELAY);
-    // Jitter ±50%: when several sessions drop together (e.g. a server restart)
-    // this staggers their reconnects instead of firing them all as one burst.
     const delay = Math.round(base * (0.5 + Math.random()));
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, delay);
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect(); }, delay);
   }
 
   private connect(): void {
@@ -802,49 +510,22 @@ class Session {
       this.everConnected = true;
       this.setConnected(true);
       this.startPing();
-      // Flush injections buffered while the socket was down (e.g. an uploaded
-      // file path whose insert raced a big-upload reconnect). The socket is
-      // OPEN here, so send() delivers them.
       if (this.pendingSeq.length) {
         const buffered = this.pendingSeq;
         this.pendingSeq = [];
         for (const s of buffered) this.send(s);
       }
-      // Re-assert a custom label: the server stores it on the tmux session
-      // (@twlabel), which is wiped when the session is killed+recreated by a
-      // restart, so a renamed tab would otherwise revert to its raw name.
       if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
-      // Re-fit + re-focus so typing resumes smoothly after a reconnect — UNLESS
-      // an IME composition is in flight: on iOS these cancel the soft keyboard's
-      // active composition, dropping the 注音 candidate bar and turning input
-      // raw/direct. Mobile reconnects are frequent, so this otherwise interrupts
-      // composing mid-word. Defer to compositionend instead.
-      if (this.composing) {
-        this.reattachAfterCompose = true;
-      } else {
-        this.fit();
-        if (isActive(this)) this.term.focus();
-      }
+      if (this.composing) { this.reattachAfterCompose = true; } else { this.fit(); if (isActive(this)) this.term.focus(); }
     };
 
     socket.onmessage = (ev: MessageEvent) => {
-      if (ev.data instanceof ArrayBuffer) {
-        this.term.write(new Uint8Array(ev.data));
-        return;
-      }
+      if (ev.data instanceof ArrayBuffer) { this.term.write(new Uint8Array(ev.data)); return; }
       if (typeof ev.data === 'string') {
         try {
           const msg = JSON.parse(ev.data) as { type?: string };
-          // The session was closed (killed) here or on another device: drop the
-          // tab and do NOT reconnect — reconnecting would recreate the session
-          // via `new-session -A`, resurrecting what was just closed.
-          if (msg && msg.type === 'closed') {
-            recentlyClosed.set(this.name, performance.now());
-            removeLocalSession(this);
-          }
-        } catch {
-          /* ignore */
-        }
+          if (msg && msg.type === 'closed') { recentlyClosed.set(this.name, performance.now()); removeLocalSession(this); }
+        } catch { /* ignore */ }
       }
     };
 
@@ -855,35 +536,15 @@ class Session {
       this.scheduleReconnect();
     };
 
-    socket.onerror = () => {
-      try {
-        socket.close();
-      } catch {
-        /* ignore */
-      }
-    };
+    socket.onerror = () => { try { socket.close(); } catch { /* ignore */ } };
   }
 
   dispose(): void {
     this.disposed = true;
     this.stopPing();
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {
-        /* ignore */
-      }
-      this.ws = null;
-    }
-    try {
-      this.term.dispose();
-    } catch {
-      /* ignore */
-    }
+    if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
+    try { this.term.dispose(); } catch { /* ignore */ }
     this.el.remove();
   }
 }
@@ -894,62 +555,40 @@ class Session {
 const sessions: Session[] = [];
 let activeSession: Session | null = null;
 
-function isActive(s: Session): boolean {
-  return activeSession === s;
-}
-
-function reflectActiveStatus(): void {
-  if (activeSession && activeSession.connected) hideStatus();
-  else showStatus('reconnecting…');
-}
-
-function updateTabDot(s: Session): void {
-  s.tabDot?.classList.toggle('connected', s.connected);
-  refreshMobileUI();
-}
+function isActive(s: Session): boolean { return activeSession === s; }
+function reflectActiveStatus(): void { if (activeSession && activeSession.connected) hideStatus(); else showStatus('reconnecting…'); }
+function updateTabDot(s: Session): void { s.tabDot?.classList.toggle('connected', s.connected); refreshMobileUI(); }
 
 function buildTab(s: Session): void {
   const tab = document.createElement('div');
   tab.className = 'tab';
   const dot = document.createElement('span');
-  dot.className = 'tab-dot';
+  dot.className = 'dot';
   const label = document.createElement('span');
-  label.className = 'tab-label';
+  label.className = 'label';
   label.textContent = s.displayName;
   label.title = `session: ${s.name} (double-click to rename)`;
   const close = document.createElement('span');
-  close.className = 'tab-close';
-  close.textContent = '×';
+  close.className = 'close';
+  close.textContent = '✕';
   close.title = 'Close tab & kill session';
   tab.append(dot, label, close);
 
-  // Single tap activates; a second tap within 350ms renames the tab. Manual
-  // detection (rather than a `dblclick` listener) because the pointerdown
-  // preventDefault below suppresses the synthesized click/dblclick events, and
-  // this also gives touch devices a double-tap-to-rename gesture.
   let lastTap = 0;
   tab.addEventListener('pointerdown', (e) => {
     if (e.target === close) return;
     e.preventDefault();
     const now = performance.now();
-    if (now - lastTap < 350) {
-      lastTap = 0;
-      promptRenameSession(s);
-      return;
-    }
+    if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
     lastTap = now;
     activateSession(s);
   });
-  close.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    confirmCloseSession(s);
-  });
+  close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); confirmCloseSession(s); });
 
   s.tabEl = tab;
   s.tabLabel = label;
   s.tabDot = dot;
-  tabsEl.insertBefore(tab, addBtn); // keep the "+" button last
+  tabsEl.insertBefore(tab, document.getElementById('addTab'));
   updateTabDot(s);
   refreshMobileUI();
 }
@@ -965,6 +604,7 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
   }
   if (makeActive) activateSession(s);
   saveTabs();
+  updateStatusBar();
   return s;
 }
 
@@ -973,17 +613,13 @@ function activateSession(s: Session): void {
   activeSession = s;
   s.setActive(true);
   for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
-  // With many tabs the active one can sit off-screen in the horizontal strip
-  // (e.g. after picking it from the drawer); scroll it back into view. inline/
-  // block: 'nearest' only scrolls #tabs horizontally, never the page/terminal.
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   reflectActiveStatus();
   refreshMobileUI();
+  updateStatusBar();
   saveTabs();
 }
 
-// Ask before killing a session: closing a tab terminates its tmux session and
-// any programs running in it, so make the user confirm first.
 function confirmCloseSession(s: Session): void {
   if (document.querySelector('.confirm-overlay')) return;
   const overlay = document.createElement('div');
@@ -995,19 +631,16 @@ function confirmCloseSession(s: Session): void {
   const strong = document.createElement('b');
   strong.textContent = s.displayName;
   const sessionNote = s.displayName === s.name ? '' : ` (tmux session "${s.name}")`;
-  label.append(
-    'Close ',
-    strong,
-    `${sessionNote}? This kills its tmux session and ends any programs running in it.`,
-  );
+  label.append('Close ', strong, `${sessionNote}? This kills its tmux session and ends any programs running in it.`);
   const row = document.createElement('div');
   row.className = 'paste-row';
   const cancel = document.createElement('button');
-  cancel.className = 'tb-btn';
+  cancel.className = 'btn btn-ghost';
   cancel.type = 'button';
   cancel.textContent = 'Cancel';
   const confirm = document.createElement('button');
-  confirm.className = 'tb-btn danger';
+  confirm.className = 'btn btn-primary';
+  confirm.style.background = 'var(--danger)';
   confirm.type = 'button';
   confirm.textContent = 'Close & kill';
   row.append(cancel, confirm);
@@ -1015,30 +648,17 @@ function confirmCloseSession(s: Session): void {
   overlay.append(box);
   document.body.append(overlay);
   window.setTimeout(() => confirm.focus(), 0);
-
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
   cancel.addEventListener('click', close);
-  confirm.addEventListener('click', () => {
-    close();
-    closeSession(s);
-  });
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  overlay.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-  });
+  confirm.addEventListener('click', () => { close(); closeSession(s); });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 }
 
 function closeSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
-  // Guard against a server sync that raced the kill re-adding this tab.
   recentlyClosed.set(s.name, performance.now());
-  // Closing a tab kills its tmux session for good (its programs are terminated).
   s.kill();
   sessions.splice(idx, 1);
   s.tabEl?.remove();
@@ -1050,6 +670,7 @@ function closeSession(s: Session): void {
   }
   if (sessions.length === 0) addSession(defaultSessionName, true);
   refreshMobileUI();
+  updateStatusBar();
   saveTabs();
 }
 
@@ -1061,21 +682,33 @@ function nextSessionName(): string {
   return `s${i}`;
 }
 
-// PWA-safe replacement for window.prompt(). iOS standalone WebViews (display:
-// standalone — see manifest) suppress or hang on the native prompt/alert/confirm
-// dialogs, which froze the whole UI when "+ New session" / rename were tapped.
-// Render our own overlay instead (same pattern as confirmCloseSession). Resolves
-// to the entered text, or null if cancelled/dismissed.
-function domPrompt(opts: {
-  label: string;
-  value?: string;
-  okText?: string;
-}): Promise<string | null> {
+async function promptAddSession(): Promise<void> {
+  const suggestion = nextSessionName();
+  const raw = await domPrompt({ label: 'New session name:', value: suggestion, okText: 'Create' });
+  if (raw === null) return;
+  addSession(sanitizeName(raw) ?? suggestion, true);
+}
+
+function setDisplayName(s: Session, displayName: string): void {
+  s.displayName = displayName;
+  if (s.tabLabel) { s.tabLabel.textContent = displayName; s.tabLabel.title = `session: ${s.name} (double-click to rename)`; }
+  refreshMobileUI();
+}
+
+async function promptRenameSession(s: Session): Promise<void> {
+  const raw = await domPrompt({ label: `Rename tab (display only — the tmux session stays "${s.name}"):`, value: s.displayName, okText: 'Rename' });
+  if (raw === null) return;
+  const trimmed = raw.trim().slice(0, 64);
+  setDisplayName(s, trimmed.length ? trimmed : s.name);
+  saveTabs();
+  renameOnServer(s.name, s.displayName);
+  activeSession?.focus();
+}
+
+// PWA-safe prompt
+function domPrompt(opts: { label: string; value?: string; okText?: string }): Promise<string | null> {
   return new Promise((resolve) => {
-    if (document.querySelector('.prompt-overlay')) {
-      resolve(null);
-      return;
-    }
+    if (document.querySelector('.prompt-overlay')) { resolve(null); return; }
     const overlay = document.createElement('div');
     overlay.className = 'paste-overlay prompt-overlay';
     const box = document.createElement('div');
@@ -1093,22 +726,18 @@ function domPrompt(opts: {
     const row = document.createElement('div');
     row.className = 'paste-row';
     const cancel = document.createElement('button');
-    cancel.className = 'tb-btn';
+    cancel.className = 'btn btn-ghost';
     cancel.type = 'button';
     cancel.textContent = 'Cancel';
     const ok = document.createElement('button');
-    ok.className = 'tb-btn';
+    ok.className = 'btn btn-primary';
     ok.type = 'button';
     ok.textContent = opts.okText ?? 'OK';
     row.append(cancel, ok);
     box.append(label, input, row);
     overlay.append(box);
     document.body.append(overlay);
-    window.setTimeout(() => {
-      input.focus();
-      input.select();
-    }, 0);
-
+    window.setTimeout(() => { input.focus(); input.select(); }, 0);
     let done = false;
     const finish = (result: string | null): void => {
       if (done) return;
@@ -1119,74 +748,18 @@ function domPrompt(opts: {
     };
     cancel.addEventListener('click', () => finish(null));
     ok.addEventListener('click', () => finish(input.value));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(null);
-    });
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        finish(input.value);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        finish(null);
-      }
-    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(null); });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); finish(input.value); } else if (e.key === 'Escape') { e.preventDefault(); finish(null); } });
   });
 }
 
-async function promptAddSession(): Promise<void> {
-  const suggestion = nextSessionName();
-  const raw = await domPrompt({
-    label: 'New session name:',
-    value: suggestion,
-    okText: 'Create',
-  });
-  if (raw === null) return; // cancelled
-  addSession(sanitizeName(raw) ?? suggestion, true);
-}
-
-// Update only the tab's display label; the tmux session name (s.name) is left
-// untouched so closing the tab still kills the original session.
-function setDisplayName(s: Session, displayName: string): void {
-  s.displayName = displayName;
-  if (s.tabLabel) {
-    s.tabLabel.textContent = displayName;
-    s.tabLabel.title = `session: ${s.name} (double-click to rename)`;
-  }
-  refreshMobileUI();
-}
-
-// Rename a tab (display only). The label can be any text; the underlying tmux
-// session keeps its original name, so × still kills the right session.
-async function promptRenameSession(s: Session): Promise<void> {
-  const raw = await domPrompt({
-    label: `Rename tab (display only — the tmux session stays "${s.name}"):`,
-    value: s.displayName,
-    okText: 'Rename',
-  });
-  if (raw === null) return; // cancelled
-  const trimmed = raw.trim().slice(0, 64);
-  setDisplayName(s, trimmed.length ? trimmed : s.name);
-  saveTabs();
-  renameOnServer(s.name, s.displayName); // sync the label to other devices
-  activeSession?.focus();
-}
-
-interface SavedTab {
-  name: string;
-  displayName: string;
-}
+interface SavedTab { name: string; displayName: string; }
 
 function saveTabs(): void {
   try {
-    localStorage.setItem(
-      'tw.tabs',
-      JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))),
-    );
+    localStorage.setItem('tw.tabs', JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))));
     if (activeSession) localStorage.setItem('tw.activeTab', activeSession.name);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 
 function loadTabs(): { tabs: SavedTab[]; active: string | null } {
@@ -1196,39 +769,24 @@ function loadTabs(): { tabs: SavedTab[]; active: string | null } {
     if (Array.isArray(parsed)) {
       const tabs: SavedTab[] = [];
       for (const item of parsed) {
-        // Old format: a bare session-name string. New format: { name, displayName }.
-        if (typeof item === 'string') {
-          tabs.push({ name: item, displayName: item });
-        } else if (item && typeof item === 'object' && typeof item.name === 'string') {
-          const dn =
-            typeof item.displayName === 'string' && item.displayName.trim().length
-              ? item.displayName
-              : item.name;
+        if (typeof item === 'string') tabs.push({ name: item, displayName: item });
+        else if (item && typeof item === 'object' && typeof item.name === 'string') {
+          const dn = typeof item.displayName === 'string' && item.displayName.trim().length ? item.displayName : item.name;
           tabs.push({ name: item.name, displayName: dn });
         }
       }
       return { tabs, active };
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return { tabs: [], active: null };
 }
 
 // ---------------------------------------------------------------------------
-// Cross-device sync: the server holds the authoritative tab list (which
-// sessions exist + their display names), so opening the page on any platform
-// shows the same tabs. localStorage is now only a per-device cache (offline
-// fallback + which tab this device last had focused).
+// Cross-device sync
 // ---------------------------------------------------------------------------
-
-// Sessions just closed on this device; suppress a racing server sync from
-// re-adding them before the kill is reflected server-side. Expired in sync().
 const recentlyClosed = new Map<string, number>();
 const CLOSE_GUARD_MS = 6000;
 
-// Fetch the server's tab list. Returns null (and we keep local state) if the
-// server is unreachable or slow, so a flaky network never blanks the tabs.
 async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1247,28 +805,17 @@ async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
       }
     }
     return out;
-  } catch {
-    return null;
-  } finally {
-    window.clearTimeout(timer);
-  }
+  } catch { return null; } finally { window.clearTimeout(timer); }
 }
 
-// Best-effort: tell the server a tab was renamed so other devices pick it up.
-// The local label is already updated; a failure just delays cross-device sync.
 function renameOnServer(name: string, displayName: string): void {
   void fetch('/api/sessions/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, displayName }),
-  }).catch(() => {
-    /* ignore — local UI already reflects the change */
-  });
+  }).catch(() => { /* ignore */ });
 }
 
-// Tear down a tab whose session was closed on another device. Unlike
-// closeSession this sends NO kill (the session is already gone server-side) —
-// it just removes the tab and frees the terminal locally.
 function removeLocalSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
@@ -1284,272 +831,167 @@ function removeLocalSession(s: Session): void {
 }
 
 let syncing = false;
-
-// Reconcile our local tabs with the server's list: adopt sessions opened (or
-// renamed) on other devices, drop sessions closed elsewhere. The active tab is
-// per-device and never changed here unless its session disappeared.
 async function syncFromServer(): Promise<void> {
   if (syncing) return;
   syncing = true;
   try {
     const serverTabs = await fetchServerTabs();
-    if (!serverTabs) return; // unreachable — keep what we have
+    if (!serverTabs) return;
     const byName = new Map(serverTabs.map((t) => [t.name, t]));
-
-    // Expire stale close-guards first so re-opening a name later still works.
     const now = performance.now();
-    for (const [name, at] of recentlyClosed) {
-      if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name);
-    }
-
-    // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
+    for (const [name, at] of recentlyClosed) { if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name); }
     for (const t of serverTabs) {
-      if (recentlyClosed.has(t.name)) continue; // don't resurrect a just-closed tab
+      if (recentlyClosed.has(t.name)) continue;
       const existing = sessions.find((s) => s.name === t.name);
-      if (!existing) {
-        addSession(t.name, false, t.displayName);
-      } else if (t.displayName && t.displayName !== existing.displayName) {
-        setDisplayName(existing, t.displayName);
-      }
+      if (!existing) addSession(t.name, false, t.displayName);
+      else if (t.displayName && t.displayName !== existing.displayName) setDisplayName(existing, t.displayName);
     }
-
-    // Remove tabs closed elsewhere. Only sessions that have actually connected
-    // (so the server knows them) are eligible — never a still-connecting new tab.
     for (const s of sessions.slice()) {
       if (byName.has(s.name)) continue;
       if (!s.everConnected) continue;
       if (recentlyClosed.has(s.name)) continue;
       removeLocalSession(s);
     }
-
     if (sessions.length === 0) addSession(defaultSessionName, true);
     saveTabs();
-  } finally {
-    syncing = false;
-  }
+  } finally { syncing = false; }
 }
 
 // ---------------------------------------------------------------------------
-// Layout: key bar height + iOS keyboard offset; fit the active session.
+// Layout: key bar height + iOS keyboard offset
 // ---------------------------------------------------------------------------
-function fitActive(): void {
-  activeSession?.fit();
-}
+function fitActive(): void { activeSession?.fit(); }
 
-// Below this width the key bar wraps to several rows (see styles.css) instead
-// of being one horizontally-scrollable row, so its height is no longer fixed.
 const mobileMQ = window.matchMedia('(max-width: 640px)');
 
-// Publish the key bar's real height into --keybar-h so the terminal sits right
-// above it: a fixed value on desktop (single row), the measured wrapped height
-// on a phone.
 function updateKeybarHeight(): void {
-  if (keybarEl.classList.contains('hidden')) {
-    root.style.setProperty('--keybar-h', '0px');
-    return;
-  }
+  if (keybarEl.classList.contains('hidden')) { root.style.setProperty('--keybar-h', '0px'); return; }
   const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
   root.style.setProperty('--keybar-h', `${h}px`);
 }
 
 function setKeybarVisible(visible: boolean): void {
   keybarEl.classList.toggle('hidden', !visible);
-  keysBtn.classList.toggle('active', visible);
+  keysBtn?.classList.toggle('active', visible);
   refreshMobileUI();
-  try {
-    localStorage.setItem('tw.keybar', visible ? '1' : '0');
-  } catch {
-    /* ignore */
-  }
-  requestAnimationFrame(() => {
-    updateKeybarHeight();
-    fitActive();
-  });
+  try { localStorage.setItem('tw.keybar', visible ? '1' : '0'); } catch { /* ignore */ }
+  requestAnimationFrame(() => { updateKeybarHeight(); fitActive(); });
 }
 
 function updateKeyboardOffset(): void {
   const vv = window.visualViewport;
   const raw = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  // Only a real soft keyboard (>~250px) takes up meaningful height. In a
-  // standalone PWA, window.innerHeight includes the status-bar + home-indicator
-  // areas that visualViewport.height excludes, so with no keyboard `raw` is the
-  // safe-area sum (~95–110px) — ignore anything below 150px so that isn't
-  // mistaken for a keyboard and left as a gap at the bottom.
   const offset = raw > 150 ? raw : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
   if (VV_DEBUG && vv) {
-    activeSession?.debugSend(
-      'vv',
-      `ih=${window.innerHeight} vvh=${Math.round(vv.height)} ` +
-        `vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} ` +
-        `raw=${Math.round(raw)} off=${Math.round(offset)}`,
-    );
+    activeSession?.debugSend('vv', `ih=${window.innerHeight} vvh=${Math.round(vv.height)} vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} raw=${Math.round(raw)} off=${Math.round(offset)}`);
   }
   fitActive();
+}
+
+function updateStatusBar(): void {
+  if (activeSession) {
+    connDot.classList.toggle('reconnecting', !activeSession.connected);
+    connDot.style.background = activeSession.connected ? '#86efac' : '#f0b429';
+    connLabel.textContent = activeSession.connected ? 'connected' : 'reconnecting…';
+    layoutLabel.textContent = '1 panel';
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Top-bar controls + on-screen key bar
 // ---------------------------------------------------------------------------
-function makeButton(
-  parent: HTMLElement,
-  cls: string,
-  label: string,
-  title: string,
-  onTap: () => void,
-): HTMLButtonElement {
+function makeButton(parent: HTMLElement, cls: string, label: string, title: string, onTap: () => void): HTMLButtonElement {
   const b = document.createElement('button');
   b.className = cls;
   b.type = 'button';
   b.textContent = label;
   b.title = title;
   b.setAttribute('aria-label', title);
-  // pointerdown + preventDefault keeps focus on the terminal so the iPad soft
-  // keyboard doesn't dismiss; the action runs here for a snappy feel.
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
   parent.append(b);
   return b;
 }
 
 function changeFont(delta: number): void {
   currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
-  try {
-    localStorage.setItem('tw.fontSize', String(currentFont));
-  } catch {
-    /* ignore */
-  }
+  try { localStorage.setItem('tw.fontSize', String(currentFont)); } catch { /* ignore */ }
   for (const s of sessions) s.setFont(currentFont);
   activeSession?.focus();
 }
 
 function toggleFullscreen(): void {
-  const d = document as Document & {
-    webkitFullscreenElement?: Element;
-    webkitExitFullscreen?: () => void;
-  };
+  const d = document as Document & { webkitFullscreenElement?: Element; webkitExitFullscreen?: () => void };
   const el = root as HTMLElement & { webkitRequestFullscreen?: () => void };
-  if (!document.fullscreenElement && !d.webkitFullscreenElement) {
-    (el.requestFullscreen ?? el.webkitRequestFullscreen)?.call(el);
-  } else {
-    (document.exitFullscreen ?? d.webkitExitFullscreen)?.call(document);
-  }
+  if (!document.fullscreenElement && !d.webkitFullscreenElement) (el.requestFullscreen ?? el.webkitRequestFullscreen)?.call(el);
+  else (document.exitFullscreen ?? d.webkitExitFullscreen)?.call(document);
   setTimeout(() => fitActive(), 100);
 }
 
-addBtn.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  promptAddSession();
-});
-
-// Sessions list (opens the same bottom-sheet drawer the phone bar uses). On a
-// tablet the top #tabs strip turns into a long horizontal scroll that's awkward
-// to swipe through once there are many tabs; this gives a one-tap vertical
-// picker instead. Hidden on phones (<=640px), which already have a ☰ in
-// #mobilebar; shown on tablet/desktop where the drawer CSS is global anyway.
-makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
+// Build controls
+// Settings button (gear icon)
+makeButton(controlsEl, 'tb-btn', '⚙', 'Settings', () => openDrawer());
+// Sessions list button
+makeButton(controlsEl, 'tb-btn', '☰', 'Sessions', () => openDrawer());
 makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
 makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
-const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
+let keysBtn: HTMLButtonElement | null = null;
+keysBtn = makeButton(controlsEl, 'tb-btn', '⌨', 'Toggle on-screen keys', () => {
   setKeybarVisible(keybarEl.classList.contains('hidden'));
   activeSession?.focus();
 });
-makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
-  activeSession?.restart();
-  activeSession?.focus();
-});
+makeButton(controlsEl, 'tb-btn', '⟳', 'Restart this session', () => { activeSession?.restart(); activeSession?.focus(); });
 
-// Reliable file attach for every platform (incl. iPad) and over plain HTTP —
-// no clipboard needed: pick any file(s), each uploads and its path is inserted.
+// File attach
 const fileInput = document.createElement('input');
 fileInput.type = 'file';
 fileInput.multiple = true;
 fileInput.style.display = 'none';
 document.body.append(fileInput);
 fileInput.addEventListener('change', () => {
-  if (fileInput.files) {
-    for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name);
-  }
+  if (fileInput.files) { for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name); }
   fileInput.value = '';
 });
-// Monochrome paperclip icon (matches the other glyphs; uses currentColor).
 const fileBtn = document.createElement('button');
-fileBtn.className = 'tb-btn tb-icon';
+fileBtn.className = 'tb-btn';
 fileBtn.type = 'button';
 fileBtn.title = 'Attach a file (upload + insert path)';
 fileBtn.setAttribute('aria-label', 'Attach a file');
-fileBtn.innerHTML =
-  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
-  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ' +
-  '5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>';
-// Use a real click (not pointerdown+preventDefault): iOS blocks opening a file
-// picker from a preventDefaulted pointer event, so the attach button did nothing
-// on phones.
+fileBtn.textContent = '📎';
 fileBtn.addEventListener('click', () => fileInput.click());
 controlsEl.append(fileBtn);
 
-// Reverse of the attach button: pull a file OFF the host back to this device.
-// A tray-with-down-arrow glyph, monochrome like the paperclip.
+// Download
 const dlBtn = document.createElement('button');
-dlBtn.className = 'tb-btn tb-icon';
+dlBtn.className = 'tb-btn';
 dlBtn.type = 'button';
 dlBtn.title = 'Download a file from the host';
 dlBtn.setAttribute('aria-label', 'Download a file from the host');
-dlBtn.innerHTML =
-  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
-  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>' +
-  '<polyline points="7 10 12 15 17 10"></polyline>' +
-  '<line x1="12" y1="15" x2="12" y2="3"></line></svg>';
+dlBtn.textContent = '⬇';
 dlBtn.addEventListener('click', () => {
   void (async () => {
-    const p = await domPrompt({
-      label: 'Download a file from the host — enter its full path',
-      value: '~/',
-      okText: 'Download',
-    });
+    const p = await domPrompt({ label: 'Download a file from the host — enter its full path', value: '~/', okText: 'Download' });
     if (p) void downloadFromHost(p);
   })();
 });
 controlsEl.append(dlBtn);
 
-makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
-makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
+makeButton(controlsEl, 'tb-btn', '⤢', 'Toggle fullscreen', toggleFullscreen);
+makeButton(controlsEl, 'tb-btn', '?', 'Help: copy / paste / files', openHelp);
 
-// --- on-screen key bar (sends to the active session) -----------------------
-interface KeyDef {
-  label?: string;
-  seq?: string;
-  mod?: 'ctrl' | 'alt';
-  action?: 'copy' | 'paste' | 'select';
-  /** Force a line break here (mobile only): the keys after it wrap to a new row. */
-  rowBreak?: boolean;
-}
+// On-screen key bar
+interface KeyDef { label?: string; seq?: string; mod?: 'ctrl' | 'alt'; action?: 'copy' | 'paste' | 'select'; rowBreak?: boolean; }
 const KEYS: KeyDef[] = [
-  { label: 'Esc', seq: '\x1b' },
-  { label: 'Tab', seq: '\t' },
-  { label: 'Ctrl', mod: 'ctrl' },
-  { label: 'Alt', mod: 'alt' },
-  { label: '^C', seq: '\x03' },
-  { label: 'Enter', seq: '\r' },
-  // Touch text-selection toggle: while armed, drag on the terminal to select and
-  // lift to copy (a tablet's stand-in for desktop Option-drag selection).
-  { label: '選取', action: 'select' },
-  // On a phone the arrows get their own second row; everything else stays on the first.
+  { label: 'Esc', seq: '\x1b' }, { label: 'Tab', seq: '\t' },
+  { label: 'Ctrl', mod: 'ctrl' }, { label: 'Alt', mod: 'alt' },
+  { label: '^C', seq: '\x03' }, { label: 'Enter', seq: '\r' },
+  { label: 'Select', action: 'select' },
   { rowBreak: true },
-  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
-  { label: '^End', seq: '\x1b[1;5F' },
-  { label: '←', seq: '\x1b[D' },
-  { label: '↑', seq: '\x1b[A' },
-  { label: '↓', seq: '\x1b[B' },
-  { label: '→', seq: '\x1b[C' },
+  { label: '←', seq: '\x1b[D' }, { label: '↑', seq: '\x1b[A' },
+  { label: '↓', seq: '\x1b[B' }, { label: '→', seq: '\x1b[C' },
 ];
 
-let ctrlArmed = false;
-let altArmed = false;
+let ctrlArmed = false, altArmed = false;
 const modButtons: Partial<Record<'ctrl' | 'alt', HTMLElement>> = {};
 let selectBtn: HTMLElement | null = null;
 
@@ -1560,17 +1002,13 @@ function refreshModVisuals(): void {
 
 function applyMods(seq: string): string {
   if (!ctrlArmed && !altArmed) return seq;
-  // oxlint-disable-next-line no-control-regex
   if (/^\x1b\[[ABCD]$/.test(seq)) {
     const mod = 1 + (altArmed ? 2 : 0) + (ctrlArmed ? 4 : 0);
     return `\x1b[1;${mod}${seq[seq.length - 1]}`;
   }
   if (seq.length === 1) {
     let ch = seq;
-    if (ctrlArmed) {
-      const code = ch.toUpperCase().charCodeAt(0);
-      if (code >= 64 && code <= 95) ch = String.fromCharCode(code & 0x1f);
-    }
+    if (ctrlArmed) { const code = ch.toUpperCase().charCodeAt(0); if (code >= 64 && code <= 95) ch = String.fromCharCode(code & 0x1f); }
     if (altArmed) ch = '\x1b' + ch;
     return ch;
   }
@@ -1593,61 +1031,34 @@ for (const def of KEYS) {
   if (def.action === 'select') selectBtn = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    // On touch, never refocus the terminal: focusing its textarea pops up the
-    // soft keyboard. The keys send their bytes straight over the WebSocket, so
-    // focus isn't needed — preventDefault already keeps whatever focus state
-    // (and thus the keyboard) the user already had.
     const refocus = e.pointerType !== 'touch';
     if (def.action === 'select') {
-      // Toggle touch-select mode. While on, dragging the terminal selects text
-      // (and lifting copies it) instead of scrolling; tap again to go back to
-      // scrolling. Never refocus — that would pop the soft keyboard.
       touchSelectMode = !touchSelectMode;
       selectBtn?.classList.toggle('armed', touchSelectMode);
       if (!touchSelectMode) activeSession?.term.clearSelection();
-      flashStatus(touchSelectMode ? '選取模式:拖曳選字→放開複製' : '選取關閉', 1600);
+      flashStatus(touchSelectMode ? 'Select mode: drag to select, lift to copy' : 'Select off', 1600);
       return;
     }
     if (def.action === 'copy') {
       const sel = activeSession?.term.getSelection() ?? '';
-      if (sel) {
-        void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
-      } else {
-        flashStatus('nothing selected', 1200);
-      }
+      if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
+      else flashStatus('nothing selected', 1200);
       if (refocus) activeSession?.focus();
       return;
     }
-    if (def.action === 'paste') {
-      pasteFromClipboard();
-      if (refocus) activeSession?.focus();
-      return;
-    }
-    if (def.mod) {
-      if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed;
-      else altArmed = !altArmed;
-      refreshModVisuals();
-      return;
-    }
+    if (def.action === 'paste') { pasteFromClipboard(); if (refocus) activeSession?.focus(); return; }
+    if (def.mod) { if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed; else altArmed = !altArmed; refreshModVisuals(); return; }
     if (def.seq !== undefined) activeSession?.sendSeq(applyMods(def.seq));
-    if (ctrlArmed || altArmed) {
-      ctrlArmed = false;
-      altArmed = false;
-      refreshModVisuals();
-    }
+    if (ctrlArmed || altArmed) { ctrlArmed = false; altArmed = false; refreshModVisuals(); }
     if (refocus) activeSession?.focus();
   });
   keybarEl.append(b);
 }
 
 // ---------------------------------------------------------------------------
-// Mobile UI: a compact top bar + a bottom "Sessions" drawer + an actions
-// sheet. Built unconditionally; CSS (@media max-width:640px) hides it on
-// desktop and hides the original #topbar on phones. Everything reuses the
-// existing session functions, so the two layouts stay in sync.
+// Mobile UI
 // ---------------------------------------------------------------------------
-const mobilebar = document.createElement('div');
-mobilebar.id = 'mobilebar';
+const mobilebar = document.getElementById('mobilebar')!;
 
 function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElement {
   const b = document.createElement('button');
@@ -1656,10 +1067,7 @@ function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElemen
   b.textContent = label;
   b.title = title;
   b.setAttribute('aria-label', title);
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
   return b;
 }
 
@@ -1675,13 +1083,8 @@ const mCaret = document.createElement('span');
 mCaret.className = 'm-caret';
 mCaret.textContent = '▾';
 mTitle.append(mTitleDot, mTitleLabel, mCaret);
-mTitle.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  openDrawer();
-});
+mTitle.addEventListener('pointerdown', (e) => { e.preventDefault(); openDrawer(); });
 
-// Built directly (not via mBtn) so it triggers on a real `click`: iOS refuses to
-// open a file picker from a preventDefaulted pointerdown.
 const mAttachBtn = document.createElement('button');
 mAttachBtn.className = 'm-btn';
 mAttachBtn.type = 'button';
@@ -1689,52 +1092,30 @@ mAttachBtn.textContent = '📎';
 mAttachBtn.title = 'Attach a file';
 mAttachBtn.setAttribute('aria-label', 'Attach a file');
 mAttachBtn.addEventListener('click', () => fileInput.click());
-const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
-  // No focus() here: on a phone, focusing the terminal pops the soft keyboard,
-  // which defeats the point of toggling the on-screen keys.
-  setKeybarVisible(keybarEl.classList.contains('hidden'));
-});
+const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => { setKeybarVisible(keybarEl.classList.contains('hidden')); });
 const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
 
 mobilebar.append(mMenuBtn, mTitle, mAttachBtn, mKeysBtn, mMoreBtn);
-document.body.append(mobilebar);
 
-// --- Sessions drawer (bottom sheet) ----------------------------------------
-const drawerOverlay = document.createElement('div');
-drawerOverlay.className = 'sheet-overlay hidden';
-const drawer = document.createElement('div');
-drawer.className = 'sheet drawer';
-const drawerGrip = document.createElement('div');
-drawerGrip.className = 'sheet-grip';
-const drawerTitle = document.createElement('div');
-drawerTitle.className = 'sheet-title';
-drawerTitle.textContent = 'Sessions';
+// --- Sessions drawer (bottom sheet) ---
+const drawerOverlay = document.getElementById('drawerOverlay')!;
 const drawerList = document.createElement('div');
 drawerList.className = 'drawer-list';
 const drawerNew = document.createElement('button');
 drawerNew.className = 'drawer-new';
 drawerNew.type = 'button';
 drawerNew.textContent = '+  New session';
-drawerNew.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  closeDrawer();
-  promptAddSession();
-});
-drawer.append(drawerGrip, drawerTitle, drawerList, drawerNew);
-drawerOverlay.append(drawer);
-document.body.append(drawerOverlay);
-drawerOverlay.addEventListener('pointerdown', (e) => {
-  if (e.target === drawerOverlay) closeDrawer();
-});
+drawerNew.addEventListener('pointerdown', (e) => { e.preventDefault(); closeDrawer(); promptAddSession(); });
+document.getElementById('drawerBody')!.append(drawerList, drawerNew);
+drawerOverlay.addEventListener('pointerdown', (e) => { if (e.target === drawerOverlay) closeDrawer(); });
 
 let drawerOpen = false;
 
-function renderDrawer(): void {
+function renderDrawerList(): void {
   drawerList.textContent = '';
   for (const s of sessions) {
     const row = document.createElement('div');
     row.className = 'drawer-row' + (s === activeSession ? ' active' : '');
-
     const body = document.createElement('div');
     body.className = 'drawer-body';
     const dot = document.createElement('span');
@@ -1743,59 +1124,32 @@ function renderDrawer(): void {
     name.className = 'drawer-name';
     name.textContent = s.displayName;
     body.append(dot, name);
-    body.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      activateSession(s);
-      closeDrawer();
-    });
-
+    body.addEventListener('pointerdown', (e) => { e.preventDefault(); activateSession(s); closeDrawer(); });
     const rename = document.createElement('button');
     rename.className = 'drawer-act';
     rename.type = 'button';
     rename.textContent = '✎';
     rename.title = 'Rename tab';
-    rename.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      promptRenameSession(s);
-      renderDrawer();
-    });
-
+    rename.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); promptRenameSession(s); renderDrawerList(); });
     const close = document.createElement('button');
     close.className = 'drawer-act danger';
     close.type = 'button';
     close.textContent = '×';
     close.title = 'Close tab & kill session';
-    close.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      closeDrawer();
-      confirmCloseSession(s);
-    });
-
+    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); closeDrawer(); confirmCloseSession(s); });
     row.append(body, rename, close);
     drawerList.append(row);
   }
 }
 
-function openDrawer(): void {
-  renderDrawer();
-  drawerOverlay.classList.remove('hidden');
-  drawerOpen = true;
-}
+function openDrawer(): void { renderDrawerList(); drawerOverlay.classList.remove('hidden'); drawerOpen = true; }
 function closeDrawer(): void {
   drawerOverlay.classList.add('hidden');
   drawerOpen = false;
-  // Don't focus the terminal on touch: this runs inside the tap gesture that
-  // picked a session, and a synchronous focus() raises the soft keyboard — so
-  // every session switch popped the keyboard. (This, not setActive()'s rAF
-  // focus, was the real culprit: focus() outside a user gesture doesn't raise
-  // the keyboard on iOS.) The drawer is mobile-only, so skip focus entirely on
-  // a coarse pointer; tap the terminal when you actually want to type.
   if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
 }
 
-// --- Actions sheet (font / restart / paste / fullscreen / help) ------------
+// --- Actions sheet ---
 const sheetOverlay = document.createElement('div');
 sheetOverlay.className = 'sheet-overlay hidden';
 const sheet = document.createElement('div');
@@ -1818,19 +1172,9 @@ const fontPlus = document.createElement('button');
 fontPlus.className = 'sf-btn';
 fontPlus.type = 'button';
 fontPlus.textContent = 'A+';
-function updateFontVal(): void {
-  fontVal.textContent = `Font ${currentFont}px`;
-}
-fontMinus.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  changeFont(-1);
-  updateFontVal();
-});
-fontPlus.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  changeFont(1);
-  updateFontVal();
-});
+function updateFontVal(): void { fontVal.textContent = `Font ${currentFont}px`; }
+fontMinus.addEventListener('pointerdown', (e) => { e.preventDefault(); changeFont(-1); updateFontVal(); });
+fontPlus.addEventListener('pointerdown', (e) => { e.preventDefault(); changeFont(1); updateFontVal(); });
 fontRow.append(fontMinus, fontVal, fontPlus);
 
 function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElement {
@@ -1843,200 +1187,83 @@ function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElem
   const t = document.createElement('span');
   t.textContent = label;
   b.append(i, t);
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
   return b;
 }
 
 sheet.append(
-  sheetGrip,
-  sheetTitle,
-  fontRow,
-  sheetRow('⟳', 'Restart this session', () => {
-    closeSheet();
-    activeSession?.restart();
-    activeSession?.focus();
-  }),
-  sheetRow('📋', 'Paste', () => {
-    closeSheet();
-    pasteFromClipboard();
-  }),
-  sheetRow('⤢', 'Toggle fullscreen', () => {
-    closeSheet();
-    toggleFullscreen();
-  }),
-  sheetRow('?', 'Help: copy / paste / files', () => {
-    closeSheet();
-    openHelp();
-  }),
+  sheetGrip, sheetTitle, fontRow,
+  sheetRow('⟳', 'Restart this session', () => { closeSheet(); activeSession?.restart(); activeSession?.focus(); }),
+  sheetRow('📋', 'Paste', () => { closeSheet(); pasteFromClipboard(); }),
+  sheetRow('⤢', 'Toggle fullscreen', () => { closeSheet(); toggleFullscreen(); }),
+  sheetRow('?', 'Help: copy / paste / files', () => { closeSheet(); openHelp(); }),
 );
 sheetOverlay.append(sheet);
 document.body.append(sheetOverlay);
-sheetOverlay.addEventListener('pointerdown', (e) => {
-  if (e.target === sheetOverlay) closeSheet();
-});
+sheetOverlay.addEventListener('pointerdown', (e) => { if (e.target === sheetOverlay) closeSheet(); });
 
-function openSheet(): void {
-  updateFontVal();
-  sheetOverlay.classList.remove('hidden');
-}
-function closeSheet(): void {
-  sheetOverlay.classList.add('hidden');
-}
+function openSheet(): void { updateFontVal(); sheetOverlay.classList.remove('hidden'); }
+function closeSheet(): void { sheetOverlay.classList.add('hidden'); }
 
-// Keep the mobile bar's title + connection dot current, and re-render the open
-// drawer when the session list / active tab / connection state changes.
 function refreshMobileUI(): void {
   const s = activeSession;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
   mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
-  if (drawerOpen) renderDrawer();
-}
-refreshMobileUI();
-
-// ---------------------------------------------------------------------------
-// Global resize handling
-// ---------------------------------------------------------------------------
-window.addEventListener('resize', () => {
-  updateKeybarHeight(); // rows may re-wrap when the width changes
-  fitActive();
-});
-// Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),
-// since the key bar switches between a fixed row and the wrapped layout.
-mobileMQ.addEventListener('change', () => {
-  updateKeybarHeight();
-  fitActive();
-});
-let areaObserver: ResizeObserver | null = null;
-if (typeof ResizeObserver !== 'undefined') {
-  areaObserver = new ResizeObserver(() => fitActive());
-  areaObserver.observe(termArea);
-}
-if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', updateKeyboardOffset);
-  window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
-  // Baseline snapshot (keyboard closed) once the WS is likely open, so the log
-  // shows the resting numbers before any keyboard event fires.
-  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
-}
-window.addEventListener('beforeunload', () => {
-  for (const s of sessions) s.dispose();
-});
-
-// ---------------------------------------------------------------------------
-// File paste / drag-drop / picker -> upload -> insert the saved path into the
-// active session, so the program running there (e.g. Claude Code) can read it.
-// Any file type works, not just images.
-// ---------------------------------------------------------------------------
-function flashStatus(text: string, ms: number): void {
-  showStatus(text);
-  window.setTimeout(() => {
-    if (statusEl?.textContent === text) hideStatus();
-  }, ms);
+  if (drawerOpen) renderDrawerList();
 }
 
-function fmtMB(bytes: number): string {
-  return (bytes / (1024 * 1024)).toFixed(1);
-}
-
-// Upload via XMLHttpRequest (not fetch): fetch exposes no upload-progress
-// events, so a big file (e.g. 75 MB) just sat on "uploading…" with no feedback.
-// xhr.upload.onprogress lets us show a live percentage, and parsing the server's
-// JSON {error} surfaces *why* an upload failed (e.g. "file too large") instead
-// of a generic message. Never rejects — always resolves so callers can `void` it.
+// ---------------------------------------------------------------------------
+// File upload / download
+// ---------------------------------------------------------------------------
 function uploadFile(file: Blob, name?: string): Promise<void> {
   return new Promise((resolve) => {
-    if (!file) {
-      resolve();
-      return;
-    }
-    // Bind the destination to the tab that's active NOW, at upload start — the
-    // file belongs to the terminal you attached it from. onload can fire much
-    // later (a big upload, or you switched tabs / backgrounded the app while it
-    // ran); using the live activeSession there sent the path to whatever tab
-    // happened to be active on completion — the wrong one, or none you were
-    // looking at. sendSeq buffers it if that tab's socket is mid-reconnect.
+    if (!file) { resolve(); return; }
     const target = activeSession;
     const label = name ?? 'file';
     showStatus(`uploading ${label}… 0%`);
-
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-
     xhr.upload.onprogress = (e): void => {
       if (e.lengthComputable) {
         const pct = Math.round((e.loaded / e.total) * 100);
-        showStatus(
-          `uploading ${label}… ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`,
-        );
+        showStatus(`uploading ${label}… ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`);
       } else {
         showStatus(`uploading ${label}… ${fmtMB(e.loaded)} MB`);
       }
     };
-    // All bytes are sent; the server is now writing the file and replying.
     xhr.upload.onload = (): void => showStatus(`uploading ${label}… finishing…`);
-
     xhr.onload = (): void => {
       let data: { path?: string; error?: string } = {};
-      try {
-        data = JSON.parse(xhr.responseText) as typeof data;
-      } catch {
-        /* non-JSON response */
-      }
+      try { data = JSON.parse(xhr.responseText) as typeof data; } catch { /* non-JSON */ }
       if (xhr.status >= 200 && xhr.status < 300 && data.path) {
         if (target) {
-          // Quote the path if it contains whitespace; append a space so it reads
-          // as a complete argument at the prompt.
-          const p = /\s/.test(data.path)
-            ? `'${data.path.replace(/'/g, `'\\''`)}'`
-            : data.path;
+          const p = /\s/.test(data.path) ? `'${data.path.replace(/'/g, `'\\''`)}'` : data.path;
           target.sendSeq(p + ' ');
           if (isActive(target)) target.focus();
         }
-        // If it landed on a tab you've since switched away from, name it so you
-        // know where the path went instead of it seeming to vanish.
         const where = target && !isActive(target) ? ` → ${target.displayName}` : '';
         flashStatus(`file added${where}: ${data.path}`, 2500);
       } else {
-        flashStatus(
-          data.error ? `upload failed: ${data.error}` : 'file upload failed',
-          3500,
-        );
+        flashStatus(data.error ? `upload failed: ${data.error}` : 'file upload failed', 3500);
       }
       resolve();
     };
-    xhr.onerror = (): void => {
-      flashStatus('file upload failed', 2500);
-      resolve();
-    };
+    xhr.onerror = (): void => { flashStatus('file upload failed', 2500); resolve(); };
     xhr.send(file);
   });
 }
 
-// Pull a file off the host back to this device — the reverse of uploadFile. A
-// HEAD pre-check turns a bad path into a toast instead of silently saving the
-// server's 404 body as a file; the real GET then streams through a transient
-// <a download> so large files never buffer in memory. Auth rides on the
-// same-origin tw_auth cookie automatically.
 async function downloadFromHost(rawPath: string): Promise<void> {
   const p = rawPath.trim();
   if (!p) return;
   const url = '/api/download?path=' + encodeURIComponent(p);
   showStatus(`preparing ${p}…`);
   let head: Response;
-  try {
-    head = await fetch(url, { method: 'HEAD' });
-  } catch {
-    flashStatus('download failed (network)', 2500);
-    return;
-  }
+  try { head = await fetch(url, { method: 'HEAD' }); } catch { flashStatus('download failed (network)', 2500); return; }
   if (!head.ok) {
-    const why =
-      head.status === 404 ? 'not found' : head.status === 400 ? 'bad path' : `error ${head.status}`;
+    const why = head.status === 404 ? 'not found' : head.status === 400 ? 'bad path' : `error ${head.status}`;
     flashStatus(`download failed: ${why}`, 3000);
     return;
   }
@@ -2051,97 +1278,43 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}…`, 2500);
 }
 
-// Capture phase: xterm's own paste handler calls stopPropagation() on its
-// textarea/element, so a bubble-phase listener would never see pastes made into
-// the focused terminal. Capturing lets us intercept file pastes first. Any file
-// kind is uploaded; plain-text pastes fall through to xterm untouched.
-window.addEventListener(
-  'paste',
-  (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (PASTE_DEBUG) {
-      const cd = e.clipboardData;
-      let kinds = '(no items)';
-      if (items) {
-        const parts: string[] = [];
-        for (let i = 0; i < items.length; i += 1) parts.push(`${items[i].kind}/${items[i].type}`);
-        kinds = parts.length ? parts.join(',') : '(empty)';
-      }
-      const types = cd && cd.types ? Array.from(cd.types).join('|') : '(none)';
-      activeSession?.debugSend(
-        'paste',
-        `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`,
-      );
-    }
-    const dt = e.clipboardData;
-    if (!dt) return;
-
-    // (1) Real file items — macOS image paste, Win+Shift+S screenshots, any
-    // copied file (any type is allowed). (2) Fall back to dt.files, which some
-    // browsers populate even when the items list doesn't expose the file.
-    const files: File[] = [];
-    if (items) {
-      for (let i = 0; i < items.length; i += 1) {
-        if (items[i].kind === 'file') {
-          const f = items[i].getAsFile();
-          if (f) files.push(f);
-        }
-      }
-    }
-    if (files.length === 0 && dt.files) {
-      for (let i = 0; i < dt.files.length; i += 1) files.push(dt.files[i]);
-    }
-    if (files.length > 0) {
-      e.preventDefault();
-      e.stopImmediatePropagation(); // don't let xterm also handle it
-      for (const f of files) void uploadFile(f, f.name);
+// Paste / drag-drop file handling
+window.addEventListener('paste', (e: ClipboardEvent) => {
+  const items = e.clipboardData?.items;
+  if (PASTE_DEBUG) {
+    const cd = e.clipboardData;
+    let kinds = '(no items)';
+    if (items) { const parts: string[] = []; for (let i = 0; i < items.length; i += 1) parts.push(`${items[i].kind}/${items[i].type}`); kinds = parts.length ? parts.join(',') : '(empty)'; }
+    const types = cd && cd.types ? Array.from(cd.types).join('|') : '(none)';
+    activeSession?.debugSend('paste', `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`);
+  }
+  const dt = e.clipboardData;
+  if (!dt) return;
+  const files: File[] = [];
+  if (items) { for (let i = 0; i < items.length; i += 1) { if (items[i].kind === 'file') { const f = items[i].getAsFile(); if (f) files.push(f); } } }
+  if (files.length === 0 && dt.files) { for (let i = 0; i < dt.files.length; i += 1) files.push(dt.files[i]); }
+  if (files.length > 0) { e.preventDefault(); e.stopImmediatePropagation(); for (const f of files) void uploadFile(f, f.name); return; }
+  const html = dt.getData ? dt.getData('text/html') : '';
+  if (html) {
+    const src = new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') ?? '';
+    if (src.startsWith('data:image/') || src.startsWith('blob:')) {
+      e.preventDefault(); e.stopImmediatePropagation();
+      void (async () => {
+        try {
+          const blob = await fetch(src).then((r) => r.blob());
+          if (blob.type.startsWith('image/')) { const ext = (blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png'; await uploadFile(blob, `pasted-image.${ext}`); }
+        } catch { flashStatus('paste: could not read the image', 2500); }
+      })();
       return;
     }
-
-    // (3) Windows-Chrome case: copying an image from a web page (or Office)
-    // often delivers it ONLY as text/html (an <img src="data:...">) with NO
-    // file item, so the checks above find nothing. Recover the embedded image
-    // by parsing the HTML and fetching a data:/blob: src into a Blob. Remote
-    // http(s)/file: srcs can't be fetched client-side (CORS/security), so those
-    // fall through to xterm's normal text paste.
-    const html = dt.getData ? dt.getData('text/html') : '';
-    if (html) {
-      const src =
-        new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') ??
-        '';
-      if (src.startsWith('data:image/') || src.startsWith('blob:')) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        void (async () => {
-          try {
-            const blob = await fetch(src).then((r) => r.blob());
-            if (blob.type.startsWith('image/')) {
-              const ext = (blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
-              await uploadFile(blob, `pasted-image.${ext}`);
-            }
-          } catch {
-            flashStatus('paste: could not read the image', 2500);
-          }
-        })();
-        return;
-      }
-      if (PASTE_DEBUG && src) {
-        activeSession?.debugSend('paste', `unfetchable img src=${src.slice(0, 48)}`);
-      }
-    }
-    // Nothing uploadable: let xterm handle the (text) paste.
-  },
-  true,
-);
+  }
+}, true);
 
 function dragHasFile(dt: DataTransfer | null): boolean {
   if (!dt) return false;
-  for (let i = 0; i < dt.items.length; i += 1) {
-    if (dt.items[i].kind === 'file') return true;
-  }
+  for (let i = 0; i < dt.items.length; i += 1) { if (dt.items[i].kind === 'file') return true; }
   return false;
 }
-
 termArea.addEventListener('dragover', (e) => {
   if (!dragHasFile(e.dataTransfer)) return;
   e.preventDefault();
@@ -2158,62 +1331,51 @@ termArea.addEventListener('drop', (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Init: restore tabs (or start one), restore prefs, activate.
+// Init
 // ---------------------------------------------------------------------------
 const urlSession = sanitizeName(params.get('session'));
-const cached = loadTabs(); // per-device cache: offline fallback + last focus
-// A sensible value from the first tick (used by closeSession / syncFromServer
-// before init resolves); init refines it once the tab list is known.
+const cached = loadTabs();
 let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
 async function init(): Promise<void> {
-  // The server's list is authoritative; fall back to the local cache, then to
-  // a single default session when both are empty.
   const server = await fetchServerTabs();
-  let initialTabs: SavedTab[] =
-    server && server.length
-      ? server
-      : cached.tabs.length
-        ? cached.tabs.slice()
-        : [{ name: defaultSessionName, displayName: defaultSessionName }];
-  if (urlSession && !initialTabs.some((t) => t.name === urlSession)) {
-    initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
-  }
+  let initialTabs: SavedTab[] = server && server.length ? server : cached.tabs.length ? cached.tabs.slice() : [{ name: defaultSessionName, displayName: defaultSessionName }];
+  if (urlSession && !initialTabs.some((t) => t.name === urlSession)) initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
-
   for (const t of initialTabs) addSession(t.name, false, t.displayName);
-
   const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
   activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
 }
 
 void init();
 
-// Keep the tab list in sync with the server: when the page regains focus /
-// visibility, and on a light interval while visible.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') void syncFromServer();
-});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void syncFromServer(); });
 window.addEventListener('focus', () => void syncFromServer());
-setInterval(() => {
-  if (document.visibilityState === 'visible') void syncFromServer();
-}, 5000);
+setInterval(() => { if (document.visibilityState === 'visible') void syncFromServer(); }, 5000);
 
-// Default: show the key bar on touch devices, hidden on desktop (unless saved).
 const keybarDefault = (() => {
-  try {
-    const v = localStorage.getItem('tw.keybar');
-    if (v !== null) return v === '1';
-  } catch {
-    /* ignore */
-  }
+  try { const v = localStorage.getItem('tw.keybar'); if (v !== null) return v === '1'; } catch { /* ignore */ }
   return window.matchMedia('(pointer: coarse)').matches;
 })();
 setKeybarVisible(keybarDefault);
 
-// First visit: show the copy/paste/image hint once.
-try {
-  if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700);
-} catch {
-  /* ignore */
+try { if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700); } catch { /* ignore */ }
+
+window.addEventListener('resize', () => { updateKeybarHeight(); fitActive(); });
+mobileMQ.addEventListener('change', () => { updateKeybarHeight(); fitActive(); });
+if (typeof ResizeObserver !== 'undefined') { const areaObserver = new ResizeObserver(() => fitActive()); areaObserver.observe(termArea); }
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', updateKeyboardOffset);
+  window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
 }
+window.addEventListener('beforeunload', () => { for (const s of sessions) s.dispose(); });
+// Apply initial theme
+pushCssVars(THEMES.aurora);
+
+
+// Simulate reconnect -> connected on first load
+connDot.classList.add('reconnecting');
+connDot.style.background = '#f0b429';
+connLabel.textContent = 'reconnecting…';
+setTimeout(() => { connDot.classList.remove('reconnecting'); connDot.style.background = '#86efac'; connLabel.textContent = 'connected'; }, 1200);
