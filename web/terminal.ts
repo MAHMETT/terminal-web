@@ -365,6 +365,28 @@ let activeTabId = 1;
 
 function activeTabData(): TabData | undefined { return tabDataList.find((t) => t.id === activeTabId); }
 
+function findTabDataForSession(s: Session): TabData | undefined {
+  for (const td of tabDataList) {
+    const leaf = findLeafBySession(td.root, s);
+    if (leaf) return td;
+  }
+  return undefined;
+}
+
+function findLeafBySession(node: SplitTree, s: Session): SplitLeaf | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).session === s ? (node as SplitLeaf) : null;
+  for (const c of (node as SplitNode).children) {
+    const found = findLeafBySession(c, s);
+    if (found) return found;
+  }
+  return null;
+}
+
+function hasAnySession(node: SplitTree): boolean {
+  if (node.type === 'leaf') return (node as SplitLeaf).session !== null;
+  return (node as SplitNode).children.some(hasAnySession);
+}
+
 function countLeaves(node: SplitTree): number { return node.type === 'leaf' ? 1 : (node as SplitNode).children.reduce((s, c) => s + countLeaves(c), 0); }
 function firstLeafId(node: SplitTree): number { return node.type === 'leaf' ? (node as SplitLeaf).id : firstLeafId((node as SplitNode).children[0]); }
 function findLeaf(node: SplitTree, id: number): SplitLeaf | null {
@@ -994,6 +1016,12 @@ function activateSession(s: Session): void {
   if (activeSession && activeSession !== s) activeSession.setActive(false);
   activeSession = s;
   s.setActive(true);
+  // Sync activeTabId with the TabData that owns this session
+  const td = findTabDataForSession(s);
+  if (td && td.id !== activeTabId) {
+    activeTabId = td.id;
+    renderPanes();
+  }
   for (const x of sessions) {
     x.tabEl?.classList.toggle('active', x === s);
     x.tabEl?.setAttribute('aria-selected', x === s ? 'true' : 'false');
@@ -1048,19 +1076,34 @@ function closeSession(s: Session): void {
   sessions.splice(idx, 1);
   s.tabEl?.remove();
   s.dispose();
-  // Remove from any split-tree leaf
+  // Remove from split-tree leaves
   for (const td of tabDataList) {
     removeSessionFromTree(td.root, s);
   }
+  // Remove TabData entries whose tree has no sessions left
+  for (let i = tabDataList.length - 1; i >= 0; i--) {
+    if (!hasAnySession(tabDataList[i].root)) {
+      if (tabDataList[i].id === activeTabId) activeTabId = -1;
+      tabDataList.splice(i, 1);
+    }
+  }
   if (activeSession === s) {
     activeSession = null;
-    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
-    if (next) activateSession(next);
+    // If the active tab was removed, switch to the first remaining tab
+    if (activeTabId === -1 && tabDataList.length > 0) {
+      activeTabId = tabDataList[0].id;
+      const leaf = findLeafBySession(tabDataList[0].root, sessions[0]);
+      if (leaf && leaf.session) activateSession(leaf.session);
+    } else {
+      const next = sessions[idx] ?? sessions[idx - 1] ?? null;
+      if (next) activateSession(next);
+    }
   }
   if (sessions.length === 0) addSession(defaultSessionName, true);
   refreshMobileUI();
   updateStatusBar();
   saveTabs();
+  renderPanes();
 }
 
 function removeSessionFromTree(node: SplitTree, s: Session): void {
@@ -1666,7 +1709,12 @@ newTabInput.addEventListener('keydown', (e) => {
 function confirmNewTab(): void {
   const name = newTabInput.value.trim() || nextSessionName();
   const sanitized = sanitizeName(name) ?? name;
-  addSession(sanitized, true);
+  const s = addSession(sanitized, true);
+  // Create TabData for the new tab so renderPanes() has a split-tree to render
+  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1 };
+  tabDataList.push(td);
+  activeTabId = td.id;
+  renderPanes();
   closeModal();
   showToast(`Tab "${sanitized}" created`);
 }
