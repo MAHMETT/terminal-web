@@ -352,9 +352,8 @@ The `?` help overlay summarizes these (with the right keys for your OS).
 ## Environment variables
 
 All are optional. Copy `.env.example` to `.env` to override defaults. `.env` is
-loaded by `scripts/start.sh` and `scripts/dev.sh` (`bun run dev`). Running
-`bun start` directly does **not** auto-load `.env` -- export the vars in
-your shell instead, e.g. `HOST=100.x.y.z PORT=8090 bun start`.
+auto-loaded by `bun start` (via `--env-file`), `scripts/start.sh`, and
+`scripts/dev.sh` (`bun run dev`).
 
 | Variable          | Default                                              | Description                                                                 |
 | ----------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
