@@ -555,6 +555,7 @@ async function handleListFiles(
 ): Promise<void> {
   const raw = dirPath ?? "~";
   const abs = resolveFilePath(raw);
+  console.log("[fm] handleListFiles raw=%s abs=%s", raw, abs);
 
   let stat: fs.Stats;
   try {
