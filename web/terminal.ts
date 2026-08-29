@@ -548,6 +548,8 @@ class Session {
   private composing = false;
   private reattachAfterCompose = false;
   private pendingSeq: string[] = [];
+  private _paneBodyObserved = false;
+  private _paneBodyObserver: ResizeObserver | null = null;
 
   constructor(name: string, displayName?: string) {
     this.name = name;
@@ -793,6 +795,13 @@ class Session {
     if (this.paneEl) {
       (this.paneEl as unknown as { _paneId?: number })._paneId = paneId;
       container.append(this.paneEl);
+      // Observe the pane-body element so xterm fits exactly when its size changes
+      // (e.g. divider drag, window resize, layout change).
+      if (typeof ResizeObserver !== 'undefined' && !this._paneBodyObserved) {
+        this._paneBodyObserved = true;
+        this._paneBodyObserver = new ResizeObserver(() => this.fit());
+        this._paneBodyObserver.observe(this.el);
+      }
     }
   }
 
@@ -877,6 +886,7 @@ class Session {
   dispose(): void {
     this.disposed = true;
     this.stopPing();
+    if (this._paneBodyObserver) { this._paneBodyObserver.disconnect(); this._paneBodyObserver = null; }
     if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
     try { this.term.dispose(); } catch { /* ignore */ }
@@ -1055,33 +1065,52 @@ function activateSession(s: Session): void {
 }
 
 function confirmCloseSession(s: Session): void {
+  if (!settings.confirmClose) { closeSession(s); return; }
   if (document.querySelector('.confirm-overlay')) return;
+
   const overlay = document.createElement('div');
-  overlay.className = 'paste-overlay confirm-overlay';
-  const box = document.createElement('div');
-  box.className = 'paste-box confirm-box';
-  const label = document.createElement('div');
-  label.className = 'paste-label';
-  const strong = document.createElement('b');
-  strong.textContent = s.displayName;
+  overlay.className = 'modal-overlay confirm-overlay open';
+
+  const card = document.createElement('div');
+  card.className = 'modal-card confirm-card';
+
+  // Icon
+  const icon = document.createElement('div');
+  icon.className = 'confirm-icon';
+  icon.innerHTML = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+
+  // Title
+  const title = document.createElement('h3');
+  title.className = 'confirm-title';
+  title.textContent = 'Close terminal';
+
+  // Description
+  const desc = document.createElement('p');
+  desc.className = 'confirm-desc';
   const sessionNote = s.displayName === s.name ? '' : ` (tmux session "${s.name}")`;
-  label.append('Close ', strong, `${sessionNote}? This kills its tmux session and ends any programs running in it.`);
-  const row = document.createElement('div');
-  row.className = 'paste-row';
+  desc.textContent = `Close "${s.displayName}"${sessionNote}? This kills its tmux session and ends any programs running in it.`;
+
+  // Actions
+  const actions = document.createElement('div');
+  actions.className = 'modal-actions confirm-actions';
+
   const cancel = document.createElement('button');
   cancel.className = 'btn btn-ghost';
   cancel.type = 'button';
   cancel.textContent = 'Cancel';
+
   const confirm = document.createElement('button');
-  confirm.className = 'btn btn-primary';
-  confirm.style.background = 'var(--danger)';
+  confirm.className = 'btn btn-primary confirm-btn-danger';
   confirm.type = 'button';
   confirm.textContent = 'Close & kill';
-  row.append(cancel, confirm);
-  box.append(label, row);
-  overlay.append(box);
+
+  actions.append(cancel, confirm);
+  card.append(icon, title, desc, actions);
+  overlay.append(card);
   document.body.append(overlay);
+
   window.setTimeout(() => confirm.focus(), 0);
+
   const close = (): void => { overlay.remove(); activeSession?.focus(); };
   cancel.addEventListener('click', close);
   confirm.addEventListener('click', () => { close(); closeSession(s); });

@@ -162,10 +162,11 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
   flex:1; position:relative; min-height:0; min-width:0; overflow:hidden;
   display:flex; flex-direction:column;
 }
-/* xterm fills its container */
+/* xterm fills its container — mobile-first min dimensions */
 .xterm{ height:100%; width:100%; }
 .xterm .xterm-viewport, .xterm .xterm-screen{ width:100%; height:100%; }
-.pane .xterm{ position:absolute; top:0; left:0; right:0; bottom:0; height:auto; width:auto; }
+.pane .xterm{ position:absolute; inset:0; }
+.pane{ min-width:0; min-height:0; }
 
 /* Drag-and-drop overlay */
 .workspace.dragging::after{
@@ -320,6 +321,29 @@ input[type=range]{ width:110px; }
 .btn-ghost:hover{ background:rgba(255,255,255,.06); color:var(--text); }
 .btn-primary{ background:var(--accent); color:#0b0d10; }
 .btn-primary:hover{ filter:brightness(1.08); }
+
+/* Confirm dialog (danger variant) */
+.confirm-overlay{ z-index:62; }
+.confirm-card{ width:360px; max-width:92vw; padding:24px 24px 20px; }
+.confirm-icon{
+  display:flex; align-items:center; justify-content:center;
+  width:48px; height:48px; border-radius:50%;
+  background:rgba(251,113,133,.12); color:var(--danger);
+  margin:0 auto 14px;
+}
+.confirm-title{
+  font-size:15px; font-weight:600; color:var(--text); text-align:center;
+  margin-bottom:8px;
+}
+.confirm-desc{
+  font-size:13px; color:var(--muted); line-height:1.5;
+  text-align:center; margin-bottom:20px;
+}
+.confirm-actions{ justify-content:center; gap:10px; }
+.confirm-btn-danger{
+  background:var(--danger); color:#0b0d10; font-weight:500;
+}
+.confirm-btn-danger:hover{ filter:brightness(1.1); }
 
 /* ==========================================================================
    Toast notification
@@ -502,7 +526,9 @@ input[type=range]{ width:110px; }
   .mini-btn{ width:26px; height:26px; font-size:12px; }
   .pane-body{ padding:9px 10px; font-size:12.5px; }
   .workspace{ padding:5px; }
-  .pane{ margin:2px; border-radius:8px; }
+  .pane{ margin:2px; border-radius:8px; min-width:0; min-height:0; }
+  .split-child{ min-width:0; min-height:0; }
+  .pane-grid > *{ min-width:0; min-height:0; }
   .statusbar{ font-size:10px; gap:9px; padding:6px 10px; }
   .statusbar .status-item:nth-child(3),
   .statusbar .status-item:nth-child(4){ display:none; }
@@ -525,7 +551,12 @@ input[type=range]{ width:110px; }
     position:fixed; top:calc(42px + env(safe-area-inset-top));
     left:0; right:0; bottom:var(--kb-offset);
     padding:4px;
+    display:flex;
   }
+  .pane-grid{ flex:1; display:flex; min-width:0; min-height:0; overflow:auto; }
+  .pane{ min-width:0; min-height:0; }
+  .split-child{ min-width:0; }
+  .pane-grid > *{ min-width:0; }
   #keybar{
     height:auto; flex-wrap:wrap; align-content:flex-start;
     gap:6px; overflow:visible; padding-top:6px;
