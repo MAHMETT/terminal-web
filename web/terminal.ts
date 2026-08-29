@@ -2292,8 +2292,10 @@ async function loadFmDir(dirPath: string): Promise<void> {
   try {
     const res = await fetch('/api/files?path=' + encodeURIComponent(dirPath));
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'unknown' }));
-      fmList.innerHTML = `<div class="fm-empty">${err.error ?? 'Error loading directory'}</div>`;
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      fmList.innerHTML = `<div class="fm-empty">${msg}</div>`;
       return;
     }
     const data = await res.json() as { path: string; items: { name: string; type: string; size: number; mtime: string }[] };
@@ -2383,8 +2385,10 @@ async function showFmPreview(filePath: string, fileName: string): Promise<void> 
   try {
     const res = await fetch('/api/files/read?path=' + encodeURIComponent(filePath));
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'unknown' }));
-      fmPreviewContent.textContent = err.error ?? 'Cannot read file';
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      fmPreviewContent.textContent = msg;
       return;
     }
     const data = await res.json() as { content: string; size: number };
@@ -2445,8 +2449,10 @@ async function createFmItem(): Promise<void> {
     if (res.ok) {
       void loadFmDir(fmCurrentPath);
     } else {
-      const err = await res.json().catch(() => ({ error: 'unknown' }));
-      flashStatus(`create failed: ${err.error}`, 3000);
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`create failed: ${msg}`, 3000);
     }
   } catch { flashStatus('create failed (network)', 2500); }
 }
@@ -2484,8 +2490,10 @@ async function renameFmItem(): Promise<void> {
     if (res.ok) {
       void loadFmDir(fmCurrentPath);
     } else {
-      const err = await res.json().catch(() => ({ error: 'unknown' }));
-      flashStatus(`rename failed: ${err.error}`, 3000);
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`rename failed: ${msg}`, 3000);
     }
   } catch { flashStatus('rename failed (network)', 2500); }
 }
@@ -2521,8 +2529,10 @@ async function deleteFmItem(): Promise<void> {
     if (res.ok) {
       void loadFmDir(fmCurrentPath);
     } else {
-      const err = await res.json().catch(() => ({ error: 'unknown' }));
-      flashStatus(`delete failed: ${err.error}`, 3000);
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`delete failed: ${msg}`, 3000);
     }
   } catch { flashStatus('delete failed (network)', 2500); }
 }
