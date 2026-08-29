@@ -196,7 +196,7 @@ WorkingDirectory=${REPO_ROOT}
 # local disk; be explicit so a slow day does not trip the start timeout.
 TimeoutStartSec=180
 ExecStart=
-ExecStart=${BUN_BIN} src/server.ts
+ExecStart=${BUN_BIN} --no-env-file src/server.ts
 EOF
 
 say "Reloading systemd and restarting ${UNIT}"

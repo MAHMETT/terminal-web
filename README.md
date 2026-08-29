@@ -16,7 +16,7 @@ on your laptop and keep going from your phone — it's the **same live session**
 
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
 Bun + TypeScript server using [`ws`](https://github.com/websockets/ws) and
-[`node-pty`](https://github.com/microsoft/node-pty) on the back end.
+[`Bun.Terminal`](https://bun.sh/docs/api/bun#pseudo-terminals) on the back end.
 
 It's designed to live on your **Tailnet**: the server binds to your Tailscale
 IP and, by default, has **no application-level auth** — anyone who can reach the
@@ -68,7 +68,7 @@ for details.
                   binary = raw bytes, text = JSON control
   +-----------------+   <------------------------------->   +--------------------+
   |     Browser     |                                       |   Node.js server   |
-  |   (xterm.js)    |  --- input bytes (binary frame) --->  |   ws + node-pty    |
+  |   (xterm.js)    |  --- input bytes (binary frame) --->  |   ws + Bun.Terminal   |
   |  FitAddon       |  <-- output bytes (binary frame) ---  |                    |
   |  WebLinksAddon  |  --- {resize|ping} (text frame)  -->  |   spawns a pty     |
   |  WebglAddon     |  <-- {pong} (text frame)         ---  |   per connection   |
@@ -102,8 +102,6 @@ project:
 - **Bun** (ESM, runs the server directly)
 - **tmux** — the session backend (`brew install tmux` on macOS,
   `sudo apt install tmux` on Debian/Ubuntu)
-- **Linux only:** a C/C++ toolchain + Python 3 to build `node-pty`
-  (`sudo apt install -y build-essential python3`) — see [Install](#install)
 - **tailscale** — **optional**. Only used to auto-detect which IP to bind to.
   Not installed? It's fine — set `HOST` yourself (see
   [Without Tailscale](#without-tailscale-lan--intranet)).
@@ -117,14 +115,6 @@ Development was done on macOS.
 ```bash
 bun install
 ```
-
-> **Note:** `node-pty` is a native addon. It ships **prebuilt** binaries for
-> macOS and Windows, but on **Linux it compiles from source on install** — so
-> you need a C/C++ toolchain + Python 3
-> (`sudo apt install -y build-essential python3` on Debian/Ubuntu). On macOS,
-> if no prebuilt matches your Node version it also compiles, which needs the
-> Xcode Command Line Tools (`xcode-select --install`). See
-> [Troubleshooting](#troubleshooting) if install fails.
 
 ---
 
@@ -353,8 +343,8 @@ The `?` help overlay summarizes these (with the right keys for your OS).
 
 All are optional. Copy `.env.example` to `.env` to override defaults. `.env` is
 loaded by `scripts/start.sh` and `scripts/dev.sh` (`bun run dev`). Running
-`bun start` directly does **not** auto-load `.env` -- export the vars in
-your shell instead, e.g. `HOST=100.x.y.z PORT=8090 bun start`.
+`bun start` directly does **not** load `.env` (uses `--no-env-file`); export
+the vars in your shell instead, e.g. `HOST=100.x.y.z PORT=8090 bun start`.
 
 | Variable          | Default                                              | Description                                                                 |
 | ----------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -426,12 +416,6 @@ Treat exposing this as equivalent to handing out SSH access.
 ---
 
 ## Troubleshooting
-
-**`node-pty` fails to build / `bun install` errors with node-gyp**
-`node-pty` is a native addon. Ensure you have a C/C++ toolchain:
-- macOS: `xcode-select --install`
-- Make sure your Bun version is up to date.
-- Try a clean reinstall: `rm -rf node_modules && bun install`.
 
 **"tmux: command not found" / sessions don't start**
 Install tmux (`brew install tmux`). The server spawns `tmux` per connection

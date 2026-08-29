@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { SearchAddon } from '@xterm/addon-search';
 
 // ---------------------------------------------------------------------------
 // Constants & helpers
@@ -11,55 +12,27 @@ const MIN_DELAY = 500;
 const MAX_DELAY = 5000;
 const MIN_FONT = 8;
 const MAX_FONT = 28;
-const KEYBAR_HEIGHT = 48; // px when shown
+const KEYBAR_HEIGHT = 48;
 
-// Touch "select" mode (toggled from the key bar). tmux runs with `mouse on`, so
-// a finger drag is normally hijacked for scrolling and there is no way to make a
-// text selection by touch (on desktop you hold Option to bypass tmux's mouse
-// reporting; a tablet has no such key). While this is on, a one-finger drag
-// selects text instead of scrolling, and lifting the finger copies it.
 let touchSelectMode = false;
-// Window to drop a duplicated IME emission. The CapsLock-switch double-send
-// arrives ~100-120ms apart (keydown-finalize then compositionend-finalize), so
-// 100ms was just too tight; 300ms covers it with margin while staying far below
-// the interval of any legitimate re-typing of the same characters.
 const IME_DEDUP_MS = 300;
-
-// Cap on the bytes of discrete injections (uploaded file path, paste, key-bar
-// press) buffered while the WebSocket is down, so a long outage can't grow the
-// queue without bound. 64 KB is far more than any real path/paste.
 const MAX_PENDING_SEQ = 64 * 1024;
-
-// macOS uses ⌘ for copy/paste (never a terminal control key), so xterm passes
-// it through to the browser. Everything else uses Ctrl, which collides with the
-// terminal's ^C/^V — hence the OS-specific copy/paste key handling below.
 const isMac = /Mac|iP(hone|ad|od)/.test(navigator.platform || navigator.userAgent);
 
 const params = new URLSearchParams(window.location.search);
 const IME_DEBUG = (params.get('debug') ?? '').includes('ime');
-// ?debug=vv logs visualViewport metrics (keyboard occlusion / Safari pan) to
-// the server log via the same WS debug channel, for on-device layout diagnosis.
 const VV_DEBUG = (params.get('debug') ?? '').includes('vv');
-// ?debug=paste logs what each paste event actually carries (clipboard types,
-// item kinds/types, file count) — for diagnosing why image paste-to-upload
-// behaves differently across browsers/OSes (e.g. Windows Chrome).
 const PASTE_DEBUG = (params.get('debug') ?? '').includes('paste');
-// WebGL renderer is on by default; ?webgl=0 (or ?nowebgl) falls back to the DOM
-// renderer — useful for flaky GPUs or headless capture.
 const WEBGL_ENABLED = params.get('webgl') !== '0' && !params.has('nowebgl');
-
 const encoder = new TextEncoder();
+const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
 
-/** Sanitize a session name to [A-Za-z0-9_-]{1,64}; null if nothing usable. */
 function sanitizeName(raw: string | null | undefined): string | null {
   if (typeof raw !== 'string') return null;
   const cleaned = raw.replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
   return cleaned.length ? cleaned : null;
 }
 
-// Copy text to the clipboard. Uses the async Clipboard API on a secure context
-// (HTTPS), else falls back to a hidden-textarea + execCommand("copy"), which
-// works over plain HTTP within a user gesture.
 async function copyText(text: string): Promise<boolean> {
   if (!text) return false;
   try {
@@ -67,9 +40,7 @@ async function copyText(text: string): Promise<boolean> {
       await navigator.clipboard.writeText(text);
       return true;
     }
-  } catch {
-    /* fall through to the legacy path */
-  }
+  } catch { /* fall through */ }
   try {
     const ta = document.createElement('textarea');
     ta.value = text;
@@ -81,36 +52,18 @@ async function copyText(text: string): Promise<boolean> {
     const ok = document.execCommand('copy');
     ta.remove();
     return ok;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-// Read the clipboard and send it to the active session. Reading requires a
-// secure context (HTTPS); over HTTP we can't, so hint the user to use Cmd/Ctrl-V
-// (the native paste event still works when the terminal is focused).
 function pasteFromClipboard(): void {
   const clip = navigator.clipboard;
   if (clip && typeof clip.readText === 'function' && window.isSecureContext) {
-    clip
-      .readText()
-      .then((t) => {
-        if (t) activeSession?.sendSeq(t);
-        else openPasteBox();
-      })
-      .catch(() => openPasteBox());
+    clip.readText().then((t) => { if (t) activeSession?.sendSeq(t); else openPasteBox(); }).catch(() => openPasteBox());
   } else {
-    // Plain HTTP can't read the clipboard via JS, so pop a box the user pastes
-    // into (native paste into a real textarea works on HTTP and iPad).
     openPasteBox();
   }
 }
 
-// Rich paste for the Windows/Linux Ctrl+Shift+V chord: unlike Chrome's built-in
-// "paste as plain text" (which drops images) or readText() (text only), the
-// async Clipboard API returns BOTH text and image blobs — so a pasted image
-// uploads and text goes to the shell. Falls back to the text-only path when the
-// Clipboard read API isn't available (non-secure context / older browsers).
 async function pasteRich(): Promise<void> {
   const clip = navigator.clipboard;
   if (clip && typeof clip.read === 'function' && window.isSecureContext) {
@@ -131,15 +84,11 @@ async function pasteRich(): Promise<void> {
         }
       }
       if (handled) return;
-    } catch {
-      /* permission denied / not focused — fall back to the legacy paths */
-    }
+    } catch { /* permission denied / not focused */ }
   }
   pasteFromClipboard();
 }
 
-// A small overlay with a real <textarea> the user pastes into, then we forward
-// the text to the active session. Works without the Clipboard API (HTTP/iPad).
 function openPasteBox(): void {
   if (document.querySelector('.paste-overlay')) return;
   const overlay = document.createElement('div');
@@ -148,20 +97,20 @@ function openPasteBox(): void {
   box.className = 'paste-box';
   const label = document.createElement('div');
   label.className = 'paste-label';
-  label.textContent = `Paste here (${isMac ? '⌘V' : 'Ctrl+V'} / long-press → Paste) — sends automatically`;
+  label.textContent = `Paste here (${isMac ? '⌘V' : 'Ctrl+V'}) — sends automatically`;
   const ta = document.createElement('textarea');
   ta.className = 'paste-ta';
-  ta.setAttribute('autocapitalize', 'off');
-  ta.setAttribute('autocomplete', 'off');
+  ta.autocapitalize = 'off';
+  ta.autocomplete = 'off';
   ta.spellcheck = false;
   const row = document.createElement('div');
   row.className = 'paste-row';
   const cancel = document.createElement('button');
-  cancel.className = 'tb-btn';
+  cancel.className = 'btn btn-ghost';
   cancel.type = 'button';
   cancel.textContent = 'Cancel';
   const send = document.createElement('button');
-  send.className = 'tb-btn';
+  send.className = 'btn btn-primary';
   send.type = 'button';
   send.textContent = 'Send';
   row.append(cancel, send);
@@ -169,32 +118,17 @@ function openPasteBox(): void {
   overlay.append(box);
   document.body.append(overlay);
   window.setTimeout(() => ta.focus(), 0);
-
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
-  const submit = (): void => {
-    const t = ta.value;
-    if (t) activeSession?.sendSeq(t);
-    close();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
+  const submit = (): void => { const t = ta.value; if (t) activeSession?.sendSeq(t); close(); };
   send.addEventListener('click', submit);
   cancel.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  // One-tap feel: auto-send right after a paste lands in the box.
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
   ta.addEventListener('paste', () => window.setTimeout(submit, 0));
-  ta.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-  });
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 }
 
-// Quick help overlay: how to copy / paste / attach files. Shown from the "?"
-// button and once automatically on first visit.
 function openHelp(): void {
-  if (document.querySelector('.help-overlay')) return;
+  if (document.querySelector('.paste-overlay')) return;
   const selKey = isMac ? '⌥ Option' : 'Shift';
   const pasteKey = isMac ? '⌘V' : 'Ctrl+Shift+V';
   const copyKey = isMac ? '⌘C' : 'Ctrl+Shift+C';
@@ -205,220 +139,499 @@ function openHelp(): void {
   box.innerHTML =
     '<div class="help-title">How to copy / paste / files</div>' +
     '<ul class="help-list">' +
-    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b> / tap <b>Copy</b>.)</li>` +
-    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box that appears.</li>` +
-    '<li><b>Attach a file</b> (for Claude Code etc.) — tap the 📎 button, or paste / drag any file (image, PDF, text…): it uploads and inserts the file path. Then press Enter.</li>' +
-    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host (e.g. <code>~/output/report.zip</code>); it downloads to this device. Tip: run <code>realpath &lt;file&gt;</code> in the terminal to get the path.</li>' +
+    `<li><b>Copy</b> — hold <b>${selKey}</b> and drag to select; it copies automatically. (Or select, then <b>${copyKey}</b>.)</li>` +
+    `<li><b>Paste</b> — click the terminal, then <b>${pasteKey}</b>. On a phone/tablet, tap <b>Paste</b> and paste into the box.</li>` +
+    '<li><b>Attach a file</b> — tap the 📎 button, or paste / drag any file: it uploads and inserts the file path.</li>' +
+    '<li><b>Download a file</b> — tap the ⬇ button and enter a path on the host.</li>' +
     '<li><b>Scroll</b> — mouse wheel or two-finger swipe scrolls the history.</li>' +
-    '<li><b>Tabs</b> — <b>+</b> new session, <b>×</b> closes the tab and kills its session, <b>⟳</b> restarts the session fresh. Double-click (or double-tap) a tab to rename it — the label changes but its tmux session stays the same.</li>' +
+    '<li><b>Tabs</b> — <b>+</b> new session, drag to reorder, <b>×</b> closes the tab and kills its session.</li>' +
     '</ul>' +
-    '<div class="paste-row"><button class="tb-btn" type="button" data-help-close>Got it</button></div>';
+    '<div class="paste-row"><button class="btn btn-ghost" type="button" data-help-close>Got it</button></div>';
   overlay.append(box);
   document.body.append(overlay);
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
   box.querySelector('[data-help-close]')?.addEventListener('click', close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  try {
-    localStorage.setItem('tw.helpSeen', '1');
-  } catch {
-    /* ignore */
-  }
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  try { localStorage.setItem('tw.helpSeen', '1'); } catch { /* ignore */ }
 }
 
-const THEME = {
-  background: '#1e1e1e',
-  foreground: '#d4d4d4',
-  cursor: '#d4d4d4',
-  cursorAccent: '#1e1e1e',
-  selectionBackground: '#264f78',
-  black: '#000000',
-  red: '#cd3131',
-  green: '#0dbc79',
-  yellow: '#e5e510',
-  blue: '#2472c8',
-  magenta: '#bc3fbc',
-  cyan: '#11a8cd',
-  white: '#e5e5e5',
-  brightBlack: '#666666',
-  brightRed: '#f14c4c',
-  brightGreen: '#23d18b',
-  brightYellow: '#f5f543',
-  brightBlue: '#3b8eea',
-  brightMagenta: '#d670d6',
-  brightCyan: '#29b8db',
-  brightWhite: '#ffffff',
+// ---------------------------------------------------------------------------
+// Theme system
+// ---------------------------------------------------------------------------
+interface ThemeDef { name: string; bg: string; panel: string; pane: string; paneAlt: string; border: string; borderSoft: string; text: string; muted: string; dim: string; accent: string; accent2: string; }
+const THEMES: Record<string, ThemeDef> = {
+  aurora:  { name: 'Graphite Aurora', bg: '#14161b', panel: '#1a1d24', pane: '#101217', paneAlt: '#0d0f13', border: '#262b34', borderSoft: '#1f232b', text: '#e7e9ee', muted: '#8a90a0', dim: '#565c6a', accent: '#5eead4', accent2: '#a78bfa' },
+  nord:    { name: 'Nord Mist',       bg: '#1b2028', panel: '#212734', pane: '#171b22', paneAlt: '#141820', border: '#2c3341', borderSoft: '#242a36', text: '#e3e8f0', muted: '#7f8ba1', dim: '#565f70', accent: '#7fb2f0', accent2: '#f0a37f' },
+  solaris: { name: 'Solaris Light',   bg: '#f6f5f1', panel: '#ffffff', pane: '#fbfaf7', paneAlt: '#f1efe9', border: '#e2e0d8', borderSoft: '#ebe9e2', text: '#2a2b28', muted: '#7a7972', dim: '#a4a297', accent: '#1f8a70', accent2: '#b5533c' },
+  ink:     { name: 'Mono Ink',        bg: '#121212', panel: '#181818', pane: '#0e0e0e', paneAlt: '#0a0a0a', border: '#262626', borderSoft: '#1e1e1e', text: '#eaeaea', muted: '#8f8f8f', dim: '#5a5a5a', accent: '#f5f5f5', accent2: '#9a9a9a' },
+  custom:  { name: 'Custom',          bg: '#171a20', panel: '#1d212a', pane: '#12151b', paneAlt: '#0d1017', border: '#2a3140', borderSoft: '#222838', text: '#e8ebf0', muted: '#8890a0', dim: '#5c6370', accent: '#f2a65a', accent2: '#7fb2f0' },
+};
+let currentTheme = 'aurora';
+function splitPaneId(td: TabData, paneId: number, dir: 'row' | 'col'): void {
+  const holder: { newId: number | null } = { newId: null };
+  td.root = insertSplit(td.root, paneId, dir, holder);
+  if (holder.newId) td.focused = holder.newId;
+  renderPanes();
+}
+
+function closePane(td: TabData, paneId: number): void {
+  if (countLeaves(td.root) <= 1) { confirmCloseSession(activeSession!); return; }
+  const leaf = findLeaf(td.root, paneId);
+  if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
+  td.root = removeLeaf(td.root, paneId)!;
+  if (td.focused === paneId) td.focused = firstLeafId(td.root);
+  renderTabs();
+  renderPanes();
+}
+
+function setSingleLayout(td: TabData): void {
+  // Kill all sessions except focused
+  const focusedId = td.focused;
+  const killIds: number[] = [];
+  const collectIds = (node: SplitTree): void => {
+    if (node.type === 'leaf') { if ((node as SplitLeaf).id !== focusedId) killIds.push((node as SplitLeaf).id); }
+    else { for (const c of (node as SplitNode).children) collectIds(c); }
+  };
+  collectIds(td.root);
+  for (const id of killIds) {
+    const leaf = findLeaf(td.root, id);
+    if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
+  }
+  const focusedLeaf = findLeaf(td.root, focusedId);
+  td.root = { type: 'leaf', id: focusedId, session: focusedLeaf?.session ?? null };
+  renderTabs();
+  renderPanes();
+}
+
+function setGridLayout(td: TabData): void {
+  // Kill existing sessions (keep active)
+  const existingSessions = new Map<number, Session>();
+  const collectAll = (node: SplitTree): void => {
+    if (node.type === 'leaf') { const l = node as SplitLeaf; if (l.session) existingSessions.set(l.id, l.session); }
+    else { for (const c of (node as SplitNode).children) collectAll(c); }
+  };
+  collectAll(td.root);
+  const ids = [paneSeq++, paneSeq++, paneSeq++, paneSeq++];
+  td.root = {
+    type: 'split', dir: 'col', ratio: [0.5, 0.5], children: [
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[0], session: null }, { type: 'leaf', id: ids[1], session: null }] },
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[2], session: null }, { type: 'leaf', id: ids[3], session: null }] },
+    ],
+  };
+  // Reuse existing session for first pane, kill the rest
+  if (activeSession) {
+    const firstLeaf = findLeaf(td.root, ids[0]);
+    if (firstLeaf) firstLeaf.session = activeSession;
+    for (const [, s] of existingSessions) {
+      if (s !== activeSession) { s.kill(); sessions.splice(sessions.indexOf(s), 1); s.dispose(); }
+    }
+  }
+  td.focused = ids[0];
+  renderTabs();
+  renderPanes();
+}
+
+function clearFocusedPane(td: TabData): void {
+  const leaf = findLeaf(td.root, td.focused);
+  if (leaf) leaf.cleared = true;
+  renderPanes();
+  showToast('Panel cleared');
+}
+
+// ---------------------------------------------------------------------------
+// Tree rendering (builds DOM from split-tree)
+// ---------------------------------------------------------------------------
+const mql = window.matchMedia('(max-width: 700px)');
+function effectiveDir(dir: string): string { return mql.matches ? 'col' : dir; }
+mql.addEventListener('change', renderPanes);
+
+function renderTree(node: SplitTree, td: TabData): HTMLElement {
+  if (node.type === 'leaf') {
+    const leaf = node as SplitLeaf;
+    const wrapper = document.createElement('div');
+    wrapper.style.cssText = 'flex:1;min-width:0;min-height:0;display:flex;width:100%;height:100%;';
+    if (!leaf.session) {
+      // Create a new session for this pane
+      const name = nextSessionName();
+      leaf.session = addSession(name, false);
+    }
+    const s = leaf.session;
+    s.attachTo(wrapper, leaf.id);
+    s.setActive(leaf.id === td.focused);
+    // Store paneId on the paneEl for split/close button handlers
+    wrapper.addEventListener('click', () => {
+      if (td.focused !== leaf.id) { td.focused = leaf.id; renderPanes(); }
+    });
+    return wrapper;
+  }
+  const sn = node as SplitNode;
+  const dir = effectiveDir(sn.dir);
+  const wrap = document.createElement('div');
+  wrap.className = 'split-container ' + (dir === 'row' ? 'split-row' : 'split-col');
+  const childWraps = sn.children.map((child, i) => {
+    const cw = document.createElement('div');
+    cw.className = 'split-child';
+    cw.style.flexBasis = (sn.ratio[i] * 100) + '%';
+    cw.appendChild(renderTree(child, td));
+    return cw;
+  });
+  childWraps.forEach((cw, i) => {
+    wrap.appendChild(cw);
+    if (i < childWraps.length - 1) {
+      const divider = document.createElement('div');
+      divider.className = 'divider ' + (dir === 'row' ? 'divider-row' : 'divider-col');
+      attachDividerDrag(divider, sn, i, dir, wrap, childWraps[i], childWraps[i + 1]);
+      wrap.appendChild(divider);
+    }
+  });
+  return wrap;
+}
+
+function renderPanes(): void {
+  const td = activeTabData();
+  if (!td) return;
+  paneGrid.innerHTML = '';
+  paneGrid.appendChild(renderTree(td.root, td));
+  updateLayoutLabel();
+  // Defer fit until browser has computed layout. Use both rAF (fast path)
+  // and a timeout fallback (covers slow font-load or layout shifts).
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    fitActive();
+    // Second pass: some layout-triggered reflows (e.g. font load, scroll-
+    // bar appearance) only settle after the first fit changes the terminal.
+    window.setTimeout(fitActive, 80);
+  }));
+}
+
+function updateLayoutLabel(): void {
+  const td = activeTabData();
+  if (!td) return;
+  const n = countLeaves(td.root);
+  layoutLabel.textContent = n === 1 ? '1 panel' : n + ' panels';
+}
+
+function pushCssVars(t: ThemeDef): void {
+  const r = document.documentElement.style;
+  r.setProperty('--bg', t.bg);
+  r.setProperty('--panel', t.panel);
+  r.setProperty('--pane', t.pane);
+  r.setProperty('--pane-alt', t.paneAlt);
+  r.setProperty('--border', t.border);
+  r.setProperty('--border-soft', t.borderSoft);
+  r.setProperty('--text', t.text);
+  r.setProperty('--muted', t.muted);
+  r.setProperty('--dim', t.dim);
+  r.setProperty('--accent', t.accent);
+  r.setProperty('--accent2', t.accent2);
+  r.setProperty('--accent-soft', t.accent + '26');
+  // Update xterm theme
+  XTERM_THEME.background = t.pane;
+  XTERM_THEME.foreground = t.text;
+  XTERM_THEME.cursor = t.accent;
+  XTERM_THEME.cursorAccent = t.pane;
+  XTERM_THEME.selectionBackground = t.accent;
+}
+
+const XTERM_THEME: Record<string, string> = {
+  background: '#101217', foreground: '#e7e9ee', cursor: '#5eead4', cursorAccent: '#101217',
+  selectionBackground: '#5eead4',
+  black: '#000000', red: '#cd3131', green: '#0dbc79', yellow: '#e5e510',
+  blue: '#2472c8', magenta: '#bc3fbc', cyan: '#11a8cd', white: '#e5e5e5',
+  brightBlack: '#666666', brightRed: '#f14c4c', brightGreen: '#23d18b',
+  brightYellow: '#f5f543', brightBlue: '#3b8eea', brightMagenta: '#d670d6',
+  brightCyan: '#29b8db', brightWhite: '#ffffff',
 };
 
-const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws';
-
 // ---------------------------------------------------------------------------
-// DOM
+// DOM refs
 // ---------------------------------------------------------------------------
 const root = document.documentElement;
-const topbar = document.getElementById('topbar') as HTMLElement;
-const termArea = document.getElementById('terminal') as HTMLElement;
-const keybarEl = document.getElementById('keybar') as HTMLElement;
+const paneGrid = document.getElementById('paneGrid')!;
+
+// ---------------------------------------------------------------------------
+// Split-tree pane system
+// ---------------------------------------------------------------------------
+interface SplitLeaf {
+  type: 'leaf';
+  id: number;
+  session: Session | null;
+  cleared?: boolean;
+}
+interface SplitNode {
+  type: 'split';
+  dir: 'row' | 'col';
+  ratio: number[];
+  children: (SplitLeaf | SplitNode)[];
+}
+type SplitTree = SplitLeaf | SplitNode;
+
+interface TabData {
+  id: number;
+  title: string;
+  root: SplitTree;
+  focused: number; // pane id
+}
+
+let paneSeq = 30;
+let tabIdSeq = 1;
+const tabDataList: TabData[] = [];
+let activeTabId = 1;
+
+function activeTabData(): TabData | undefined { return tabDataList.find((t) => t.id === activeTabId); }
+
+function findTabDataForSession(s: Session): TabData | undefined {
+  for (const td of tabDataList) {
+    const leaf = findLeafBySession(td.root, s);
+    if (leaf) return td;
+  }
+  return undefined;
+}
+
+function findLeafBySession(node: SplitTree, s: Session): SplitLeaf | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).session === s ? (node as SplitLeaf) : null;
+  for (const c of (node as SplitNode).children) {
+    const found = findLeafBySession(c, s);
+    if (found) return found;
+  }
+  return null;
+}
+
+function hasAnySession(node: SplitTree): boolean {
+  if (node.type === 'leaf') return (node as SplitLeaf).session !== null;
+  return (node as SplitNode).children.some(hasAnySession);
+}
+
+function countLeaves(node: SplitTree): number { return node.type === 'leaf' ? 1 : (node as SplitNode).children.reduce((s, c) => s + countLeaves(c), 0); }
+function firstLeafId(node: SplitTree): number { return node.type === 'leaf' ? (node as SplitLeaf).id : firstLeafId((node as SplitNode).children[0]); }
+function findLeaf(node: SplitTree, id: number): SplitLeaf | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).id === id ? node as SplitLeaf : null;
+  for (const c of (node as SplitNode).children) { const r = findLeaf(c, id); if (r) return r; }
+  return null;
+}
+function insertSplit(node: SplitTree, id: number, dir: 'row' | 'col', holder: { newId: number | null }): SplitTree {
+  if (node.type === 'leaf') {
+    if ((node as SplitLeaf).id === id) {
+      const newId = paneSeq++;
+      holder.newId = newId;
+      return { type: 'split', dir, ratio: [0.5, 0.5], children: [{ type: 'leaf', id: (node as SplitLeaf).id, session: (node as SplitLeaf).session }, { type: 'leaf', id: newId, session: null }] };
+    }
+    return node;
+  }
+  return { ...(node as SplitNode), children: (node as SplitNode).children.map((c) => insertSplit(c, id, dir, holder)) };
+}
+function removeLeaf(node: SplitTree, id: number): SplitTree | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).id === id ? null : node;
+  const sn = node as SplitNode;
+  const newChildren: SplitTree[] = [];
+  const newRatio: number[] = [];
+  sn.children.forEach((c, i) => {
+    const res = removeLeaf(c, id);
+    if (res !== null) { newChildren.push(res); newRatio.push(sn.ratio[i]); }
+  });
+  if (newChildren.length === 0) return null;
+  if (newChildren.length === 1) return newChildren[0];
+  const sum = newRatio.reduce((a, b) => a + b, 0) || 1;
+  return { type: 'split', dir: sn.dir, children: newChildren, ratio: newRatio.map((r) => r / sum) };
+}
+
+function clamp(v: number, min: number, max: number): number { return Math.min(max, Math.max(min, v)); }
+
+// ---------------------------------------------------------------------------
+// Divider drag-to-resize
+// ---------------------------------------------------------------------------
+function attachDividerDrag(divider: HTMLElement, node: SplitNode, i: number, dir: string, containerEl: HTMLElement, leftEl: HTMLElement, rightEl: HTMLElement): void {
+  divider.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    try { divider.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    divider.classList.add('active');
+    document.body.style.userSelect = 'none';
+    const rect = containerEl.getBoundingClientRect();
+    const total = dir === 'row' ? rect.width : rect.height;
+    const startPos = dir === 'row' ? e.clientX : e.clientY;
+    const baseA = node.ratio[i], baseB = node.ratio[i + 1];
+    const pairTotal = baseA + baseB;
+    let pendingA: number | null = null, pendingB: number | null = null;
+    const onMove = (ev: PointerEvent) => {
+      const pos = dir === 'row' ? ev.clientX : ev.clientY;
+      const delta = (pos - startPos) / total;
+      let newA = clamp(baseA + delta, pairTotal * 0.15, pairTotal * 0.85);
+      let newB = pairTotal - newA;
+      leftEl.style.flexBasis = (newA * 100) + '%';
+      rightEl.style.flexBasis = (newB * 100) + '%';
+      pendingA = newA; pendingB = newB;
+    };
+    const onUp = () => {
+      if (pendingA !== null) { node.ratio[i] = pendingA; node.ratio[i + 1] = pendingB!; }
+      divider.classList.remove('active');
+      document.body.style.userSelect = '';
+      divider.removeEventListener('pointermove', onMove);
+    };
+    divider.addEventListener('pointermove', onMove);
+    divider.addEventListener('pointerup', onUp, { once: true });
+  });
+}
+const keybarEl = document.getElementById('keybar')!;
 const statusEl = document.getElementById('status');
+const tabsEl = document.getElementById('tabs')!;
+const overlayEl = document.getElementById('overlay')!;
+const drawerEl = document.getElementById('drawer')!;
+const drawerBody = document.getElementById('drawerBody')!;
+const drawerTabsEl = document.getElementById('drawerTabs')!;
+const connDot = document.getElementById('connDot')!;
+const connLabel = document.getElementById('connLabel')!;
+const layoutLabel = document.getElementById('layoutLabel')!;
+const toastEl = document.getElementById('toast')!;
+const modalOverlay = document.getElementById('modalOverlay')!;
+const newTabInput = document.getElementById('newTabInput') as HTMLInputElement;
 
-// Top bar layout: [ tabs (scrollable) ... + ] [ controls ]
-const tabsEl = document.createElement('div');
-tabsEl.id = 'tabs';
-const addBtn = document.createElement('button');
-addBtn.className = 'tab-add';
-addBtn.type = 'button';
-addBtn.textContent = '+';
-addBtn.title = 'New session';
-tabsEl.append(addBtn);
-
-const controlsEl = document.createElement('div');
-controlsEl.id = 'controls';
-
-topbar.append(tabsEl, controlsEl);
 
 let currentFont = (() => {
   try {
     const n = parseInt(localStorage.getItem('tw.fontSize') ?? '', 10);
     if (!Number.isNaN(n)) return Math.min(MAX_FONT, Math.max(MIN_FONT, n));
-  } catch {
-    /* ignore */
-  }
-  return 14;
+  } catch { /* ignore */ }
+  return window.innerWidth < 700 ? 12 : 14;
 })();
+
+// Settings state
+const settings = {
+  font: 'JetBrains Mono',
+  fontSize: currentFont,
+  lineHeight: 1.6,
+  cursorStyle: 'bar' as 'bar' | 'block' | 'underline',
+  cursorBlink: true,
+  confirmClose: true,
+  bellSound: false,
+};
 
 function showStatus(text: string): void {
   if (!statusEl) return;
   statusEl.textContent = text;
   statusEl.classList.add('visible');
 }
-function hideStatus(): void {
-  statusEl?.classList.remove('visible');
+function hideStatus(): void { statusEl?.classList.remove('visible'); }
+function flashStatus(text: string, ms: number): void {
+  showStatus(text);
+  window.setTimeout(() => { if (statusEl?.textContent === text) hideStatus(); }, ms);
+}
+function fmtMB(bytes: number): string { return (bytes / (1024 * 1024)).toFixed(1); }
+
+// Toast
+let toastTimer: ReturnType<typeof setTimeout>;
+function showToast(msg: string): void {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1800);
 }
 
 // ---------------------------------------------------------------------------
-// Session: one terminal + one WebSocket + reconnect, rendered in its own pane.
+// Session class — one real terminal per tmux session
 // ---------------------------------------------------------------------------
 class Session {
-  // Immutable tmux session id — used for the WebSocket ?session= param and the
-  // kill command. Renaming a tab never touches this, so × still kills the
-  // original session.
   readonly name: string;
-  // Mutable label shown on the tab; defaults to the session name.
   displayName: string;
   readonly term: Terminal;
-  readonly el: HTMLElement;
+  readonly el: HTMLElement;          // xterm container
+  paneEl: HTMLElement | null = null; // .pane wrapper
+  paneHead: HTMLElement | null = null;
+  panePath: HTMLElement | null = null;
   tabEl: HTMLElement | null = null;
   tabLabel: HTMLElement | null = null;
   tabDot: HTMLElement | null = null;
   connected = false;
-  // True once the socket has opened at least once — i.e. the server has seen
-  // (and registered) this session. The cross-device sync only ever removes
-  // sessions that have connected, so a brand-new tab mid-connect is never
-  // mistaken for one closed elsewhere.
   everConnected = false;
 
   private readonly fitAddon = new FitAddon();
+  readonly searchAddon = new SearchAddon();
   private ws: WebSocket | null = null;
   private reconnectDelay = MIN_DELAY;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
-
-  // IME double-input guard (order-independent, content-scoped).
   private lastData = '';
   private lastDataAt = 0;
-
-  // True between compositionstart and compositionend — i.e. while the soft
-  // keyboard is mid-composition (e.g. picking a 注音 candidate). A reconnect
-  // that re-fits/re-focuses the terminal during this window cancels the iOS
-  // composition (the candidate bar vanishes, input turns raw/direct), so we
-  // defer that re-attach work until the composition commits.
   private composing = false;
   private reattachAfterCompose = false;
-
-  // Discrete injections (file path, paste, key-bar seq) buffered while the WS is
-  // not OPEN, flushed on the next reconnect (see connect's onopen). Raw typing
-  // is never buffered — only these one-shot sends routed through sendSeq().
   private pendingSeq: string[] = [];
+  private _paneBodyObserved = false;
+  private _paneBodyObserver: ResizeObserver | null = null;
 
   constructor(name: string, displayName?: string) {
     this.name = name;
     this.displayName = displayName?.trim() || name;
     this.term = new Terminal({
-      cursorBlink: true,
-      fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-      fontSize: currentFont,
+      cursorBlink: settings.cursorBlink,
+      fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+      fontSize: settings.fontSize,
       scrollback: 100000,
       allowProposedApi: true,
-      // Hold Option (macOS) / Shift (others) and drag to select text even while
-      // tmux mouse mode is on, so it can be copied.
       macOptionClickForcesSelection: true,
-      theme: THEME,
+      theme: XTERM_THEME as never,
     });
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
+    this.term.loadAddon(this.searchAddon);
+
+    // Build pane wrapper: .pane > .pane-head + .pane-body > xterm el
+    this.paneEl = document.createElement('div');
+    this.paneEl.className = 'pane';
+
+    this.paneHead = document.createElement('div');
+    this.paneHead.className = 'pane-head';
+    this.panePath = document.createElement('span');
+    this.panePath.className = 'pane-path';
+    this.panePath.textContent = `◦ zsh — ${this.displayName}`;
+    const paneActions = document.createElement('div');
+    paneActions.className = 'pane-actions';
+    paneActions.innerHTML = `
+      <button class="mini-btn" data-act="split-row" title="Split right" aria-label="Split right">⬒</button>
+      <button class="mini-btn" data-act="split-col" title="Split bottom" aria-label="Split bottom">⬓</button>
+      <button class="mini-btn danger" data-act="close" title="Close panel" aria-label="Close panel">✕</button>`;
+    paneActions.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const act = (e.target as HTMLElement).closest('.mini-btn')?.getAttribute('data-act');
+      if (!act) return;
+      const td = activeTabData();
+      if (!td) return;
+      const paneId = (this.paneEl as unknown as { _paneId?: number })._paneId;
+      if (paneId === undefined) return;
+      if (act === 'split-row') { splitPaneId(td, paneId, 'row'); showToast('Split right'); }
+      if (act === 'split-col') { splitPaneId(td, paneId, 'col'); showToast('Split bottom'); }
+      if (act === 'close') { closePane(td, paneId); }
+    });
+    this.paneHead.append(this.panePath, paneActions);
 
     this.el = document.createElement('div');
-    this.el.className = 'term-pane hidden';
-    termArea.append(this.el);
+    this.el.className = 'pane-body';
+
+    this.paneEl.append(this.paneHead, this.el);
+    // NOTE: paneEl is NOT appended to paneGrid here; tree rendering places it
+
     this.term.open(this.el);
-
     if (WEBGL_ENABLED) {
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => webgl.dispose());
-        this.term.loadAddon(webgl);
-      } catch {
-        /* fall back to the DOM renderer */
-      }
+      try { const webgl = new WebglAddon(); webgl.onContextLoss(() => webgl.dispose()); this.term.loadAddon(webgl); } catch { /* fallback */ }
     }
-
-    // Windows/Linux copy-paste. Ctrl+C / Ctrl+V collide with the terminal's own
-    // interrupt (^C) and literal (^V): xterm maps them to control bytes and
-    // cancels the keydown, which ALSO suppresses the browser's native copy/paste
-    // and the paste-to-upload event — so on Windows nothing copies, pastes, or
-    // uploads. macOS avoids this because ⌘ is never a terminal key. So on
-    // non-Mac, wire the Ctrl+Shift+C / Ctrl+Shift+V chords explicitly (as VS
-    // Code / Hyper do): copy the selection (and stop Chrome opening DevTools on
-    // Ctrl+Shift+C), and rich-paste text + images. Plain Ctrl+C stays ^C/SIGINT.
     if (!isMac) {
       this.term.attachCustomKeyEventHandler((e) => {
-        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) {
-          return true; // not a copy/paste chord — let xterm handle it normally
-        }
+        if (e.type !== 'keydown' || !e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return true;
         if (e.code === 'KeyC') {
           const sel = this.term.getSelection();
           if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
           else flashStatus('nothing selected', 1200);
-          e.preventDefault(); // block Chrome's Ctrl+Shift+C = open DevTools
-          return false; // handled — don't let xterm process it
-        }
-        if (e.code === 'KeyV') {
-          e.preventDefault(); // we paste via the Clipboard API, not the browser default
-          void pasteRich();
+          e.preventDefault();
           return false;
         }
+        if (e.code === 'KeyV') { e.preventDefault(); void pasteRich(); return false; }
         return true;
       });
     }
-
-    // Copy the selection to the clipboard when a drag/touch selection ends.
     const copySelection = (): void => {
       const sel = this.term.getSelection();
-      if (sel) {
-        void copyText(sel).then((ok) => {
-          if (ok) flashStatus('copied', 1200);
-        });
-      }
+      if (sel) void copyText(sel).then((ok) => { if (ok) flashStatus('copied', 1200); });
     };
     this.el.addEventListener('mouseup', copySelection);
     this.el.addEventListener('touchend', copySelection);
-
     this.wireInput();
     this.wireTouchScroll();
     this.connect();
@@ -428,103 +641,52 @@ class Session {
     if (!IME_DEBUG) return;
     this.debugSend(event, data);
   }
-
-  /** Ungated debug sender — callers gate on their own flag (IME_DEBUG / VV_DEBUG). */
   debugSend(event: string, data?: string): void {
-    // eslint-disable-next-line no-console
     console.log('[ime]', this.name, event, JSON.stringify(data ?? ''));
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(
-        JSON.stringify({
-          type: 'debug',
-          event,
-          data: String(data ?? ''),
-          at: Math.round(performance.now()),
-        }),
-      );
+      this.ws.send(JSON.stringify({ type: 'debug', event, data: String(data ?? ''), at: Math.round(performance.now()) }));
     }
   }
 
   private wireInput(): void {
     const ta = this.term.textarea;
     if (IME_DEBUG && ta) {
-      for (const ev of ['compositionstart', 'compositionupdate', 'compositionend']) {
+      for (const ev of ['compositionstart', 'compositionupdate', 'compositionend'] as const) {
         ta.addEventListener(ev, (e) => this.debug(ev, (e as CompositionEvent).data));
       }
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
-        if (ke.isComposing || ke.keyCode === 229 || ke.keyCode === 20) {
-          this.debug('keydown', `${ke.key}/${ke.keyCode}`);
-        }
+        if (ke.isComposing || ke.keyCode === 229 || ke.keyCode === 20) this.debug('keydown', `${ke.key}/${ke.keyCode}`);
       });
     }
-
-    // iOS CJK keyboards send punctuation, numbers and space as a keydown with
-    // keyCode 229 and the character in .key, but with NO composition and NO
-    // input event — so xterm.js drops them (in Chinese mode those keys did
-    // nothing). A real composition key (Bopomofo / pinyin letter) is also
-    // keyCode 229 but is followed by compositionstart within a few ms. So on
-    // such a keydown we schedule the character, cancel it if a composition
-    // starts, and otherwise forward it. English keys (real keyCode) and
-    // committed CJK (compositionend → onData) are untouched, so nothing doubles.
     if (ta) {
       const pendingKeys = new Map<number, string>();
       let lastSeq = -1;
       let seq = 0;
-      // Any composition activity means the most-recent IME keydown was actually
-      // composition input (Bopomofo / pinyin), so cancel its pending forward.
-      // The truly-dropped keys (punctuation / number / space) produce no
-      // composition event at all, so their forward survives and fires.
-      const cancelLast = (): void => {
-        if (lastSeq >= 0) {
-          pendingKeys.delete(lastSeq);
-          lastSeq = -1;
-        }
-      };
-      ta.addEventListener('compositionstart', () => {
-        this.composing = true;
-        cancelLast();
-      });
+      const cancelLast = (): void => { if (lastSeq >= 0) { pendingKeys.delete(lastSeq); lastSeq = -1; } };
+      ta.addEventListener('compositionstart', () => { this.composing = true; cancelLast(); });
       ta.addEventListener('compositionupdate', cancelLast);
       ta.addEventListener('compositionend', () => {
         this.composing = false;
         cancelLast();
-        // A reconnect arrived mid-composition and deferred its re-fit/re-focus
-        // (see connect's onopen) so it wouldn't cancel the composition; now that
-        // we've committed, it's safe to catch up.
-        if (this.reattachAfterCompose) {
-          this.reattachAfterCompose = false;
-          this.fit();
-          if (isActive(this)) this.term.focus();
-        }
+        if (this.reattachAfterCompose) { this.reattachAfterCompose = false; this.fit(); if (isActive(this)) this.term.focus(); }
       });
       ta.addEventListener('keydown', (e) => {
         const ke = e as KeyboardEvent;
-        if (ke.keyCode !== 229) return; // only IME-routed keys
+        if (ke.keyCode !== 229) return;
         const k = ke.key;
-        if (!k || k.length !== 1) return; // a single printable char (not Enter/Backspace/…)
+        if (!k || k.length !== 1) return;
         const s = ++seq;
         pendingKeys.set(s, k);
         lastSeq = s;
-        window.setTimeout(() => {
-          if (!pendingKeys.has(s)) return; // a composition consumed it
-          pendingKeys.delete(s);
-          this.debug('forward-key', k);
-          this.send(k);
-        }, 90);
+        window.setTimeout(() => { if (!pendingKeys.has(s)) return; pendingKeys.delete(s); this.debug('forward-key', k); this.send(k); }, 90);
       });
     }
-
     this.term.onData((data: string) => {
       this.debug('onData', data);
       const now = performance.now();
-      // Only dedupe multibyte (IME) content; ASCII/control input is never touched.
-      if (
-        /[^\x00-\x7F]/.test(data) &&
-        data === this.lastData &&
-        now - this.lastDataAt < IME_DEDUP_MS
-      ) {
-        this.lastData = ''; // suppress exactly one duplicate
+      if (/[^\x00-\x7F]/.test(data) && data === this.lastData && now - this.lastDataAt < IME_DEDUP_MS) {
+        this.lastData = '';
         this.debug('onData-DROP', data);
         return;
       }
@@ -535,161 +697,70 @@ class Session {
   }
 
   private send(data: string): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(encoder.encode(data));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(encoder.encode(data));
   }
 
-  /**
-   * Send a discrete injection (key-bar sequence, paste, uploaded file path).
-   * Unlike raw keystrokes, these are buffered and replayed on reconnect when the
-   * socket is down — a big upload can saturate the uplink, trip the 20s
-   * heartbeat, and land the path insert mid-reconnect, which would otherwise be
-   * silently dropped by send() and leave the path un-pasted.
-   */
   sendSeq(seq: string): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.send(seq);
-      return;
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) { this.send(seq); return; }
     const buffered = this.pendingSeq.reduce((n, s) => n + s.length, 0);
     if (buffered + seq.length <= MAX_PENDING_SEQ) this.pendingSeq.push(seq);
   }
 
-  // One-finger touch scrolling. tmux runs in the alternate screen (no
-  // xterm-local scrollback) with `mouse on`, so history is browsed via
-  // copy-mode, which is normally driven by the mouse wheel. A phone has no
-  // wheel, so we translate a one-finger vertical drag into SGR mouse-wheel
-  // events sent to tmux — dragging down scrolls back through history, dragging
-  // up returns toward the live prompt, just like a real wheel.
   private wireTouchScroll(): void {
-    const STEP = 22; // px of drag per wheel "tick"
-    let startX = 0;
-    let startY = 0;
-    let lastY = 0;
-    let col = 1;
-    let row = 1;
-    let tracking = false;
-    let scrolling = false;
-
-    // Touch-select state (only used while touchSelectMode is on). Anchor is the
-    // 0-based cell where the drag started, in absolute buffer coords (so it
-    // stays correct even when the view is scrolled into the scrollback).
-    let selecting = false;
-    let selMoved = false;
-    let anchorCol = 0;
-    let anchorRow = 0;
-    let cellW = 1;
-    let cellH = 1;
-    let rectLeft = 0;
-    let rectTop = 0;
-
-    // Map a touch point to a 0-based [col, absoluteRow] cell.
-    const cellAt = (clientX: number, clientY: number): [number, number] => {
-      const c = Math.max(0, Math.min(this.term.cols - 1, Math.floor((clientX - rectLeft) / cellW)));
-      const r = Math.max(0, Math.min(this.term.rows - 1, Math.floor((clientY - rectTop) / cellH)));
+    const STEP = 22;
+    let startX = 0, startY = 0, lastY = 0, col = 1, row = 1, tracking = false, scrolling = false;
+    let selecting = false, selMoved = false, anchorCol = 0, anchorRow = 0, cellW = 1, cellH = 1, rectLeft = 0, rectTop = 0;
+    const cellAt = (cx: number, cy: number): [number, number] => {
+      const c = Math.max(0, Math.min(this.term.cols - 1, Math.floor((cx - rectLeft) / cellW)));
+      const r = Math.max(0, Math.min(this.term.rows - 1, Math.floor((cy - rectTop) / cellH)));
       return [c, this.term.buffer.active.viewportY + r];
     };
-
-    this.el.addEventListener(
-      'touchstart',
-      (e: TouchEvent) => {
-        if (e.touches.length !== 1) {
-          tracking = false;
-          selecting = false;
-          return;
-        }
-        const t = e.touches[0];
-        startX = t.clientX;
-        startY = lastY = t.clientY;
-        const rect = this.el.getBoundingClientRect();
-        cellW = rect.width / Math.max(1, this.term.cols);
-        cellH = rect.height / Math.max(1, this.term.rows);
-        rectLeft = rect.left;
-        rectTop = rect.top;
-        if (touchSelectMode) {
-          // Begin a selection drag; suspend scrolling for this gesture.
-          tracking = false;
-          selecting = true;
-          selMoved = false;
-          [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY);
-          this.term.clearSelection();
-          return;
-        }
-        tracking = true;
-        scrolling = false;
-        // Cell under the finger, so tmux targets the right pane if it's split.
-        col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
-        row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
-      },
-      { capture: true, passive: true },
-    );
-
-    this.el.addEventListener(
-      'touchmove',
-      (e: TouchEvent) => {
-        if (e.touches.length !== 1) return;
-        const t = e.touches[0];
-        if (selecting) {
-          e.preventDefault();
-          e.stopPropagation();
-          if (!selMoved && Math.abs(t.clientX - startX) < 6 && Math.abs(t.clientY - startY) < 6) {
-            return; // ignore jitter until it's clearly a drag
-          }
-          selMoved = true;
-          let [sCol, sRow] = [anchorCol, anchorRow];
-          let [eCol, eRow] = cellAt(t.clientX, t.clientY);
-          // Order start-before-end so the length is positive whichever way you drag.
-          if (eRow < sRow || (eRow === sRow && eCol < sCol)) {
-            [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
-          }
-          const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
-          this.term.select(sCol, sRow, length);
-          return;
-        }
-        if (!tracking) return;
-        if (!scrolling) {
-          const dyTotal = t.clientY - startY;
-          const dxTotal = t.clientX - startX;
-          // Only hijack once the gesture is clearly a vertical drag, so taps
-          // (focus / move cursor) and horizontal gestures still reach xterm.
-          if (Math.abs(dyTotal) < 10 || Math.abs(dyTotal) <= Math.abs(dxTotal)) return;
-          scrolling = true;
-        }
-        e.preventDefault();
-        e.stopPropagation();
-        let dy = t.clientY - lastY;
-        let ticks = 0;
-        while (Math.abs(dy) >= STEP) {
-          if (dy > 0) {
-            ticks += 1; // finger down → scroll back (wheel up)
-            dy -= STEP;
-          } else {
-            ticks -= 1; // finger up → toward the live prompt (wheel down)
-            dy += STEP;
-          }
-        }
-        lastY = t.clientY - dy; // carry the sub-step remainder
-        if (ticks !== 0) this.sendWheel(ticks, col, row);
-      },
-      { capture: true, passive: false },
-    );
-
-    // Copy a finished touch selection. The bubble-phase `copySelection` handler
-    // (wired in the constructor) copies term.getSelection() on touchend, so a
-    // moved selection lands on the clipboard automatically; a tap with no drag
-    // left the selection cleared, so nothing is copied. Select mode stays armed
-    // until toggled off again.
-    const end = (): void => {
-      tracking = false;
-      scrolling = false;
-      selecting = false;
-    };
+    this.el.addEventListener('touchstart', (e: TouchEvent) => {
+      if (e.touches.length !== 1) { tracking = false; selecting = false; return; }
+      const t = e.touches[0];
+      startX = t.clientX; startY = lastY = t.clientY;
+      const rect = this.el.getBoundingClientRect();
+      cellW = rect.width / Math.max(1, this.term.cols);
+      cellH = rect.height / Math.max(1, this.term.rows);
+      rectLeft = rect.left; rectTop = rect.top;
+      if (touchSelectMode) { tracking = false; selecting = true; selMoved = false; [anchorCol, anchorRow] = cellAt(t.clientX, t.clientY); this.term.clearSelection(); return; }
+      tracking = true; scrolling = false;
+      col = Math.max(1, Math.min(this.term.cols, Math.floor((t.clientX - rectLeft) / cellW) + 1));
+      row = Math.max(1, Math.min(this.term.rows, Math.floor((t.clientY - rectTop) / cellH) + 1));
+    }, { capture: true, passive: true });
+    this.el.addEventListener('touchmove', (e: TouchEvent) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      if (selecting) {
+        e.preventDefault(); e.stopPropagation();
+        if (!selMoved && Math.abs(t.clientX - startX) < 6 && Math.abs(t.clientY - startY) < 6) return;
+        selMoved = true;
+        let [sCol, sRow] = [anchorCol, anchorRow];
+        let [eCol, eRow] = cellAt(t.clientX, t.clientY);
+        if (eRow < sRow || (eRow === sRow && eCol < sCol)) [sCol, sRow, eCol, eRow] = [eCol, eRow, sCol, sRow];
+        const length = (eRow - sRow) * this.term.cols + (eCol - sCol) + 1;
+        this.term.select(sCol, sRow, length);
+        return;
+      }
+      if (!tracking) return;
+      if (!scrolling) {
+        const dyTotal = t.clientY - startY;
+        const dxTotal = t.clientX - startX;
+        if (Math.abs(dyTotal) < 10 || Math.abs(dyTotal) <= Math.abs(dxTotal)) return;
+        scrolling = true;
+      }
+      e.preventDefault(); e.stopPropagation();
+      let dy = t.clientY - lastY;
+      let ticks = 0;
+      while (Math.abs(dy) >= STEP) { if (dy > 0) { ticks += 1; dy -= STEP; } else { ticks -= 1; dy += STEP; } }
+      lastY = t.clientY - dy;
+      if (ticks !== 0) this.sendWheel(ticks, col, row);
+    }, { capture: true, passive: false });
+    const end = (): void => { tracking = false; scrolling = false; selecting = false; };
     this.el.addEventListener('touchend', end, { capture: true, passive: true });
     this.el.addEventListener('touchcancel', end, { capture: true, passive: true });
   }
 
-  // Emit |ticks| SGR mouse-wheel events (Cb 64 = up, 65 = down; press-only).
   private sendWheel(ticks: number, col: number, row: number): void {
     const seq = `\x1b[<${ticks > 0 ? 64 : 65};${col};${row}M`;
     for (let i = Math.abs(ticks); i > 0; i -= 1) this.send(seq);
@@ -697,99 +768,95 @@ class Session {
 
   private sendResize(): void {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(
-        JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }),
-      );
+      this.ws.send(JSON.stringify({ type: 'resize', cols: this.term.cols, rows: this.term.rows }));
     }
   }
 
   fit(): void {
-    if (this.el.classList.contains('hidden')) return; // don't fit a hidden pane
-    try {
-      this.fitAddon.fit();
-    } catch {
-      /* not laid out yet */
-    }
-    this.sendResize();
+    if (this.el.classList.contains('hidden')) return;
+    const tryFit = (): void => {
+      try {
+        // Guard: parent must exist and have non-zero dimensions for FitAddon.
+        const parent = this.el.parentElement;
+        if (!parent || parent.clientWidth === 0 || parent.clientHeight === 0) {
+          requestAnimationFrame(tryFit);
+          return;
+        }
+        this.fitAddon.fit();
+      } catch {
+        requestAnimationFrame(tryFit);
+      }
+      this.sendResize();
+    };
+    tryFit();
   }
 
-  setFont(px: number): void {
-    this.term.options.fontSize = px;
-    this.fit();
-  }
+  setFont(px: number): void { this.term.options.fontSize = px; this.fit(); }
 
   setActive(active: boolean): void {
-    this.el.classList.toggle('hidden', !active);
+    this.paneEl?.classList.toggle('focused', active);
     if (active) {
+      this.panePath!.textContent = `◦ zsh — ${this.displayName}`;
       requestAnimationFrame(() => {
         this.fit();
-        // On touch (phones / iOS PWA), don't auto-focus the terminal when a
-        // session becomes active: focusing xterm's hidden textarea pops up the
-        // soft keyboard, so every tab switch forced the keyboard open and the
-        // user had to dismiss it each time. Skip the programmatic focus on a
-        // coarse pointer — tapping the terminal still focuses it (and raises the
-        // keyboard) when the user actually wants to type. Desktop keeps the
-        // immediate focus so you can type right after switching.
         if (!window.matchMedia('(pointer: coarse)').matches) this.term.focus();
       });
     }
   }
 
-  focus(): void {
-    this.term.focus();
+  /** Attach pane to a DOM container (called by tree rendering) */
+  attachTo(container: HTMLElement, paneId: number): void {
+    if (this.paneEl) {
+      (this.paneEl as unknown as { _paneId?: number })._paneId = paneId;
+      container.append(this.paneEl);
+      // Observe the pane-body element so xterm fits exactly when its size changes
+      // (e.g. divider drag, window resize, layout change).
+      if (typeof ResizeObserver !== 'undefined' && !this._paneBodyObserved) {
+        this._paneBodyObserved = true;
+        this._paneBodyObserver = new ResizeObserver(() => this.fit());
+        this._paneBodyObserver.observe(this.el);
+      }
+    }
   }
+
+  focus(): void { this.term.focus(); }
 
   restart(): void {
     this.term.reset();
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'restart' }));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'restart' }));
   }
 
-  // Ask the server to kill this tmux session for good (used on tab close).
   kill(): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'kill' }));
-    }
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'kill' }));
   }
 
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
-      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify({ type: 'ping' }));
-      }
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: 'ping' }));
     }, 20000);
   }
-  private stopPing(): void {
-    if (this.pingTimer !== null) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
-    }
-  }
+  private stopPing(): void { if (this.pingTimer !== null) { clearInterval(this.pingTimer); this.pingTimer = null; } }
 
   private setConnected(state: boolean): void {
     this.connected = state;
     updateTabDot(this);
-    if (isActive(this)) reflectActiveStatus();
+    if (isActive(this)) {
+      reflectActiveStatus();
+      updateStatusBar();
+    }
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed) return;
-    if (this.reconnectTimer !== null) return;
-    if (isActive(this)) showStatus('reconnecting…');
+    if (this.disposed || this.reconnectTimer !== null) return;
+    if (isActive(this)) showStatus('reconnecting...');
     const base = this.reconnectDelay;
     this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_DELAY);
-    // Jitter ±50%: when several sessions drop together (e.g. a server restart)
-    // this staggers their reconnects instead of firing them all as one burst.
     const delay = Math.round(base * (0.5 + Math.random()));
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this.connect();
-    }, delay);
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect(); }, delay);
   }
 
-  private connect(): void {
+  connect(): void {
     if (this.disposed) return;
     const url = `${wsProto}://${window.location.host}/ws?session=${encodeURIComponent(this.name)}`;
     const socket = new WebSocket(url);
@@ -801,49 +868,22 @@ class Session {
       this.everConnected = true;
       this.setConnected(true);
       this.startPing();
-      // Flush injections buffered while the socket was down (e.g. an uploaded
-      // file path whose insert raced a big-upload reconnect). The socket is
-      // OPEN here, so send() delivers them.
       if (this.pendingSeq.length) {
         const buffered = this.pendingSeq;
         this.pendingSeq = [];
         for (const s of buffered) this.send(s);
       }
-      // Re-assert a custom label: the server stores it on the tmux session
-      // (@twlabel), which is wiped when the session is killed+recreated by a
-      // restart, so a renamed tab would otherwise revert to its raw name.
       if (this.displayName !== this.name) renameOnServer(this.name, this.displayName);
-      // Re-fit + re-focus so typing resumes smoothly after a reconnect — UNLESS
-      // an IME composition is in flight: on iOS these cancel the soft keyboard's
-      // active composition, dropping the 注音 candidate bar and turning input
-      // raw/direct. Mobile reconnects are frequent, so this otherwise interrupts
-      // composing mid-word. Defer to compositionend instead.
-      if (this.composing) {
-        this.reattachAfterCompose = true;
-      } else {
-        this.fit();
-        if (isActive(this)) this.term.focus();
-      }
+      if (this.composing) { this.reattachAfterCompose = true; } else { this.fit(); if (isActive(this)) this.term.focus(); }
     };
 
     socket.onmessage = (ev: MessageEvent) => {
-      if (ev.data instanceof ArrayBuffer) {
-        this.term.write(new Uint8Array(ev.data));
-        return;
-      }
+      if (ev.data instanceof ArrayBuffer) { this.term.write(new Uint8Array(ev.data)); return; }
       if (typeof ev.data === 'string') {
         try {
           const msg = JSON.parse(ev.data) as { type?: string };
-          // The session was closed (killed) here or on another device: drop the
-          // tab and do NOT reconnect — reconnecting would recreate the session
-          // via `new-session -A`, resurrecting what was just closed.
-          if (msg && msg.type === 'closed') {
-            recentlyClosed.set(this.name, performance.now());
-            removeLocalSession(this);
-          }
-        } catch {
-          /* ignore */
-        }
+          if (msg && msg.type === 'closed') { recentlyClosed.set(this.name, performance.now()); removeLocalSession(this); }
+        } catch { /* ignore */ }
       }
     };
 
@@ -854,36 +894,17 @@ class Session {
       this.scheduleReconnect();
     };
 
-    socket.onerror = () => {
-      try {
-        socket.close();
-      } catch {
-        /* ignore */
-      }
-    };
+    socket.onerror = () => { try { socket.close(); } catch { /* ignore */ } };
   }
 
   dispose(): void {
     this.disposed = true;
     this.stopPing();
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {
-        /* ignore */
-      }
-      this.ws = null;
-    }
-    try {
-      this.term.dispose();
-    } catch {
-      /* ignore */
-    }
-    this.el.remove();
+    if (this._paneBodyObserver) { this._paneBodyObserver.disconnect(); this._paneBodyObserver = null; }
+    if (this.reconnectTimer !== null) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.ws) { try { this.ws.close(); } catch { /* ignore */ } this.ws = null; }
+    try { this.term.dispose(); } catch { /* ignore */ }
+    this.paneEl?.remove();
   }
 }
 
@@ -893,63 +914,128 @@ class Session {
 const sessions: Session[] = [];
 let activeSession: Session | null = null;
 
-function isActive(s: Session): boolean {
-  return activeSession === s;
+function isActive(s: Session): boolean { return activeSession === s; }
+function reflectActiveStatus(): void { if (activeSession && activeSession.connected) hideStatus(); else showStatus('reconnecting...'); }
+function updateTabDot(s: Session): void { s.tabDot?.classList.toggle('connected', s.connected); refreshMobileUI(); }
+
+// ---------------------------------------------------------------------------
+// Tab drag-and-drop reordering
+// ---------------------------------------------------------------------------
+const tabDragState: { draggingId: string | null; ghost: HTMLElement | null; moved: boolean; startX: number; startY: number; offsetX: number; offsetY: number } = { draggingId: null, ghost: null, moved: false, startX: 0, startY: 0, offsetX: 0, offsetY: 0 };
+
+function onTabPointerDown(e: PointerEvent, s: Session, el: HTMLElement): void {
+  if ((e.target as HTMLElement).classList.contains('close')) return;
+  tabDragState.startX = e.clientX;
+  tabDragState.startY = e.clientY;
+  tabDragState.moved = false;
+  const moveHandler = (ev: PointerEvent) => onTabPointerMove(ev, s, el);
+  const upHandler = (ev: PointerEvent) => {
+    onTabPointerUp(ev, s);
+    document.removeEventListener('pointermove', moveHandler);
+    document.removeEventListener('pointerup', upHandler);
+  };
+  document.addEventListener('pointermove', moveHandler);
+  document.addEventListener('pointerup', upHandler);
 }
 
-function reflectActiveStatus(): void {
-  if (activeSession && activeSession.connected) hideStatus();
-  else showStatus('reconnecting…');
+function onTabPointerMove(e: PointerEvent, s: Session, el: HTMLElement): void {
+  const dx = e.clientX - tabDragState.startX;
+  const dy = e.clientY - tabDragState.startY;
+  if (!tabDragState.moved && Math.hypot(dx, dy) > 6) {
+    tabDragState.moved = true;
+    tabDragState.draggingId = s.name;
+    const rect = el.getBoundingClientRect();
+    const ghost = el.cloneNode(true) as HTMLElement;
+    ghost.className = 'tab active';
+    ghost.style.position = 'fixed';
+    ghost.style.width = rect.width + 'px';
+    ghost.style.left = rect.left + 'px';
+    ghost.style.top = rect.top + 'px';
+    ghost.style.zIndex = '70';
+    ghost.style.pointerEvents = 'none';
+    ghost.style.boxShadow = '0 14px 34px rgba(0,0,0,0.4)';
+    ghost.style.borderRadius = '8px 8px 0 0';
+    ghost.style.background = 'var(--pane)';
+    ghost.style.opacity = '0.96';
+    document.body.appendChild(ghost);
+    tabDragState.ghost = ghost;
+    tabDragState.offsetX = e.clientX - rect.left;
+    tabDragState.offsetY = e.clientY - rect.top;
+    el.style.opacity = '0.3';
+  }
+  if (tabDragState.moved) {
+    tabDragState.ghost!.style.left = (e.clientX - tabDragState.offsetX) + 'px';
+    tabDragState.ghost!.style.top = (e.clientY - tabDragState.offsetY) + 'px';
+    reorderByPointer(e);
+  }
 }
 
-function updateTabDot(s: Session): void {
-  s.tabDot?.classList.toggle('connected', s.connected);
-  refreshMobileUI();
+function reorderByPointer(e: PointerEvent): void {
+  const els = [...tabsEl.querySelectorAll('.tab')].filter((el) => el.getAttribute('data-name') !== tabDragState.draggingId);
+  let insertBefore: string | null = null;
+  for (const el of els) {
+    const r = el.getBoundingClientRect();
+    if (e.clientX < r.left + r.width / 2) { insertBefore = el.getAttribute('data-name'); break; }
+  }
+  const curIdx = sessions.findIndex((s) => s.name === tabDragState.draggingId);
+  if (curIdx < 0) return;
+  const [dragged] = sessions.splice(curIdx, 1);
+  if (insertBefore === null) sessions.push(dragged);
+  else sessions.splice(sessions.findIndex((s) => s.name === insertBefore), 0, dragged);
+  renderTabs();
+  saveTabs();
 }
 
-function buildTab(s: Session): void {
-  const tab = document.createElement('div');
-  tab.className = 'tab';
-  const dot = document.createElement('span');
-  dot.className = 'tab-dot';
-  const label = document.createElement('span');
-  label.className = 'tab-label';
-  label.textContent = s.displayName;
-  label.title = `session: ${s.name} (double-click to rename)`;
-  const close = document.createElement('span');
-  close.className = 'tab-close';
-  close.textContent = '×';
-  close.title = 'Close tab & kill session';
-  tab.append(dot, label, close);
-
-  // Single tap activates; a second tap within 350ms renames the tab. Manual
-  // detection (rather than a `dblclick` listener) because the pointerdown
-  // preventDefault below suppresses the synthesized click/dblclick events, and
-  // this also gives touch devices a double-tap-to-rename gesture.
-  let lastTap = 0;
-  tab.addEventListener('pointerdown', (e) => {
-    if (e.target === close) return;
-    e.preventDefault();
-    const now = performance.now();
-    if (now - lastTap < 350) {
-      lastTap = 0;
-      promptRenameSession(s);
-      return;
-    }
-    lastTap = now;
+function onTabPointerUp(_e: PointerEvent, s: Session): void {
+  if (!tabDragState.moved) {
     activateSession(s);
-  });
-  close.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    confirmCloseSession(s);
-  });
+  } else {
+    if (tabDragState.ghost) { tabDragState.ghost.remove(); tabDragState.ghost = null; }
+    tabDragState.draggingId = null;
+    tabDragState.moved = false;
+    const tabEl = s.tabEl;
+    if (tabEl) tabEl.style.opacity = '';
+    saveTabs();
+    showToast('Tab order updated');
+  }
+}
 
-  s.tabEl = tab;
-  s.tabLabel = label;
-  s.tabDot = dot;
-  tabsEl.insertBefore(tab, addBtn); // keep the "+" button last
-  updateTabDot(s);
+/** Rebuild the entire tab bar from the sessions array (data-driven, matching reference) */
+function renderTabs(): void {
+  // #addTab is a SIBLING of #tabs in the HTML, not a child — just clear and rebuild.
+  tabsEl.innerHTML = '';
+  for (const s of sessions) {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (s === activeSession ? ' active' : '');
+    tab.setAttribute('data-name', s.name);
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', s === activeSession ? 'true' : 'false');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = s.displayName;
+    label.title = `session: ${s.name} (double-click to rename)`;
+    const close = document.createElement('span');
+    close.className = 'close';
+    close.textContent = '\u2715';
+    close.title = 'Close tab & kill session';
+    tab.append(dot, label, close);
+    tab.addEventListener('pointerdown', (e) => onTabPointerDown(e, s, tab));
+    let lastTap = 0;
+    tab.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).classList.contains('close')) return;
+      const now = performance.now();
+      if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
+      lastTap = now;
+    });
+    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); confirmCloseSession(s); });
+    s.tabEl = tab;
+    s.tabLabel = label;
+    s.tabDot = dot;
+    tabsEl.appendChild(tab);
+    updateTabDot(s);
+  }
   refreshMobileUI();
 }
 
@@ -958,12 +1044,13 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
   if (!s) {
     s = new Session(name, displayName);
     sessions.push(s);
-    buildTab(s);
+    renderTabs();
   } else if (displayName && displayName.trim() && displayName.trim() !== s.displayName) {
     setDisplayName(s, displayName.trim());
   }
   if (makeActive) activateSession(s);
   saveTabs();
+  updateStatusBar();
   return s;
 }
 
@@ -971,85 +1058,121 @@ function activateSession(s: Session): void {
   if (activeSession && activeSession !== s) activeSession.setActive(false);
   activeSession = s;
   s.setActive(true);
-  for (const x of sessions) x.tabEl?.classList.toggle('active', x === s);
-  // With many tabs the active one can sit off-screen in the horizontal strip
-  // (e.g. after picking it from the drawer); scroll it back into view. inline/
-  // block: 'nearest' only scrolls #tabs horizontally, never the page/terminal.
+  // Sync activeTabId with the TabData that owns this session
+  let td = findTabDataForSession(s);
+  if (!td) {
+    // Session has no TabData yet — create one (happens for sessions added by syncFromServer)
+    td = { id: tabIdSeq++, title: s.displayName, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1 };
+    tabDataList.push(td);
+  }
+  activeTabId = td.id;
+  renderPanes();
+  for (const x of sessions) {
+    x.tabEl?.classList.toggle('active', x === s);
+    x.tabEl?.setAttribute('aria-selected', x === s ? 'true' : 'false');
+  }
   s.tabEl?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   reflectActiveStatus();
   refreshMobileUI();
+  updateStatusBar();
   saveTabs();
 }
 
-// Ask before killing a session: closing a tab terminates its tmux session and
-// any programs running in it, so make the user confirm first.
 function confirmCloseSession(s: Session): void {
+  if (!settings.confirmClose) { closeSession(s); return; }
   if (document.querySelector('.confirm-overlay')) return;
+
   const overlay = document.createElement('div');
-  overlay.className = 'paste-overlay confirm-overlay';
-  const box = document.createElement('div');
-  box.className = 'paste-box confirm-box';
-  const label = document.createElement('div');
-  label.className = 'paste-label';
-  const strong = document.createElement('b');
-  strong.textContent = s.displayName;
+  overlay.className = 'modal-overlay confirm-overlay open';
+
+  const card = document.createElement('div');
+  card.className = 'modal-card confirm-card';
+
+  // Icon
+  const icon = document.createElement('div');
+  icon.className = 'confirm-icon';
+  icon.innerHTML = `<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+
+  // Title
+  const title = document.createElement('h3');
+  title.className = 'confirm-title';
+  title.textContent = 'Close terminal';
+
+  // Description
+  const desc = document.createElement('p');
+  desc.className = 'confirm-desc';
   const sessionNote = s.displayName === s.name ? '' : ` (tmux session "${s.name}")`;
-  label.append(
-    'Close ',
-    strong,
-    `${sessionNote}? This kills its tmux session and ends any programs running in it.`,
-  );
-  const row = document.createElement('div');
-  row.className = 'paste-row';
+  desc.textContent = `Close "${s.displayName}"${sessionNote}? This kills its tmux session and ends any programs running in it.`;
+
+  // Actions
+  const actions = document.createElement('div');
+  actions.className = 'modal-actions confirm-actions';
+
   const cancel = document.createElement('button');
-  cancel.className = 'tb-btn';
+  cancel.className = 'btn btn-ghost';
   cancel.type = 'button';
   cancel.textContent = 'Cancel';
+
   const confirm = document.createElement('button');
-  confirm.className = 'tb-btn danger';
+  confirm.className = 'btn btn-primary confirm-btn-danger';
   confirm.type = 'button';
   confirm.textContent = 'Close & kill';
-  row.append(cancel, confirm);
-  box.append(label, row);
-  overlay.append(box);
+
+  actions.append(cancel, confirm);
+  card.append(icon, title, desc, actions);
+  overlay.append(card);
   document.body.append(overlay);
+
   window.setTimeout(() => confirm.focus(), 0);
 
-  const close = (): void => {
-    overlay.remove();
-    activeSession?.focus();
-  };
+  const close = (): void => { overlay.remove(); activeSession?.focus(); };
   cancel.addEventListener('click', close);
-  confirm.addEventListener('click', () => {
-    close();
-    closeSession(s);
-  });
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) close();
-  });
-  overlay.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-  });
+  confirm.addEventListener('click', () => { close(); closeSession(s); });
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
 }
 
 function closeSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
-  // Guard against a server sync that raced the kill re-adding this tab.
   recentlyClosed.set(s.name, performance.now());
-  // Closing a tab kills its tmux session for good (its programs are terminated).
   s.kill();
   sessions.splice(idx, 1);
-  s.tabEl?.remove();
   s.dispose();
+  // Remove from split-tree leaves
+  for (const td of tabDataList) {
+    removeSessionFromTree(td.root, s);
+  }
+  // Remove TabData entries whose tree has no sessions left
+  for (let i = tabDataList.length - 1; i >= 0; i--) {
+    if (!hasAnySession(tabDataList[i].root)) {
+      if (tabDataList[i].id === activeTabId) activeTabId = -1;
+      tabDataList.splice(i, 1);
+    }
+  }
   if (activeSession === s) {
     activeSession = null;
-    const next = sessions[idx] ?? sessions[idx - 1] ?? null;
-    if (next) activateSession(next);
+    // If the active tab was removed, switch to the first remaining tab
+    if (activeTabId === -1 && tabDataList.length > 0) {
+      activeTabId = tabDataList[0].id;
+      const leaf = findLeafBySession(tabDataList[0].root, sessions[0]);
+      if (leaf && leaf.session) activateSession(leaf.session);
+    } else {
+      const next = sessions[idx] ?? sessions[idx - 1] ?? null;
+      if (next) activateSession(next);
+    }
   }
   if (sessions.length === 0) addSession(defaultSessionName, true);
+  renderTabs();
   refreshMobileUI();
+  updateStatusBar();
   saveTabs();
+  renderPanes();
+}
+
+function removeSessionFromTree(node: SplitTree, s: Session): void {
+  if (node.type === 'leaf') { if ((node as SplitLeaf).session === s) (node as SplitLeaf).session = null; }
+  else { for (const c of (node as SplitNode).children) removeSessionFromTree(c, s); }
 }
 
 function nextSessionName(): string {
@@ -1060,21 +1183,27 @@ function nextSessionName(): string {
   return `s${i}`;
 }
 
-// PWA-safe replacement for window.prompt(). iOS standalone WebViews (display:
-// standalone — see manifest) suppress or hang on the native prompt/alert/confirm
-// dialogs, which froze the whole UI when "+ New session" / rename were tapped.
-// Render our own overlay instead (same pattern as confirmCloseSession). Resolves
-// to the entered text, or null if cancelled/dismissed.
-function domPrompt(opts: {
-  label: string;
-  value?: string;
-  okText?: string;
-}): Promise<string | null> {
+function setDisplayName(s: Session, displayName: string): void {
+  s.displayName = displayName;
+  if (s.tabLabel) { s.tabLabel.textContent = displayName; s.tabLabel.title = `session: ${s.name} (double-click to rename)`; }
+  if (s.panePath) s.panePath.textContent = `◦ zsh — ${displayName}`;
+  refreshMobileUI();
+}
+
+async function promptRenameSession(s: Session): Promise<void> {
+  const raw = await domPrompt({ label: `Rename tab (display only — the tmux session stays "${s.name}"):`, value: s.displayName, okText: 'Rename' });
+  if (raw === null) return;
+  const trimmed = raw.trim().slice(0, 64);
+  setDisplayName(s, trimmed.length ? trimmed : s.name);
+  saveTabs();
+  renameOnServer(s.name, s.displayName);
+  activeSession?.focus();
+}
+
+// PWA-safe prompt
+function domPrompt(opts: { label: string; value?: string; okText?: string }): Promise<string | null> {
   return new Promise((resolve) => {
-    if (document.querySelector('.prompt-overlay')) {
-      resolve(null);
-      return;
-    }
+    if (document.querySelector('.prompt-overlay')) { resolve(null); return; }
     const overlay = document.createElement('div');
     overlay.className = 'paste-overlay prompt-overlay';
     const box = document.createElement('div');
@@ -1092,22 +1221,18 @@ function domPrompt(opts: {
     const row = document.createElement('div');
     row.className = 'paste-row';
     const cancel = document.createElement('button');
-    cancel.className = 'tb-btn';
+    cancel.className = 'btn btn-ghost';
     cancel.type = 'button';
     cancel.textContent = 'Cancel';
     const ok = document.createElement('button');
-    ok.className = 'tb-btn';
+    ok.className = 'btn btn-primary';
     ok.type = 'button';
     ok.textContent = opts.okText ?? 'OK';
     row.append(cancel, ok);
     box.append(label, input, row);
     overlay.append(box);
     document.body.append(overlay);
-    window.setTimeout(() => {
-      input.focus();
-      input.select();
-    }, 0);
-
+    window.setTimeout(() => { input.focus(); input.select(); }, 0);
     let done = false;
     const finish = (result: string | null): void => {
       if (done) return;
@@ -1118,74 +1243,18 @@ function domPrompt(opts: {
     };
     cancel.addEventListener('click', () => finish(null));
     ok.addEventListener('click', () => finish(input.value));
-    overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) finish(null);
-    });
-    input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        finish(input.value);
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        finish(null);
-      }
-    });
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) finish(null); });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); finish(input.value); } else if (e.key === 'Escape') { e.preventDefault(); finish(null); } });
   });
 }
 
-async function promptAddSession(): Promise<void> {
-  const suggestion = nextSessionName();
-  const raw = await domPrompt({
-    label: 'New session name:',
-    value: suggestion,
-    okText: 'Create',
-  });
-  if (raw === null) return; // cancelled
-  addSession(sanitizeName(raw) ?? suggestion, true);
-}
-
-// Update only the tab's display label; the tmux session name (s.name) is left
-// untouched so closing the tab still kills the original session.
-function setDisplayName(s: Session, displayName: string): void {
-  s.displayName = displayName;
-  if (s.tabLabel) {
-    s.tabLabel.textContent = displayName;
-    s.tabLabel.title = `session: ${s.name} (double-click to rename)`;
-  }
-  refreshMobileUI();
-}
-
-// Rename a tab (display only). The label can be any text; the underlying tmux
-// session keeps its original name, so × still kills the right session.
-async function promptRenameSession(s: Session): Promise<void> {
-  const raw = await domPrompt({
-    label: `Rename tab (display only — the tmux session stays "${s.name}"):`,
-    value: s.displayName,
-    okText: 'Rename',
-  });
-  if (raw === null) return; // cancelled
-  const trimmed = raw.trim().slice(0, 64);
-  setDisplayName(s, trimmed.length ? trimmed : s.name);
-  saveTabs();
-  renameOnServer(s.name, s.displayName); // sync the label to other devices
-  activeSession?.focus();
-}
-
-interface SavedTab {
-  name: string;
-  displayName: string;
-}
+interface SavedTab { name: string; displayName: string; }
 
 function saveTabs(): void {
   try {
-    localStorage.setItem(
-      'tw.tabs',
-      JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))),
-    );
+    localStorage.setItem('tw.tabs', JSON.stringify(sessions.map((s) => ({ name: s.name, displayName: s.displayName }))));
     if (activeSession) localStorage.setItem('tw.activeTab', activeSession.name);
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
 }
 
 function loadTabs(): { tabs: SavedTab[]; active: string | null } {
@@ -1195,39 +1264,24 @@ function loadTabs(): { tabs: SavedTab[]; active: string | null } {
     if (Array.isArray(parsed)) {
       const tabs: SavedTab[] = [];
       for (const item of parsed) {
-        // Old format: a bare session-name string. New format: { name, displayName }.
-        if (typeof item === 'string') {
-          tabs.push({ name: item, displayName: item });
-        } else if (item && typeof item === 'object' && typeof item.name === 'string') {
-          const dn =
-            typeof item.displayName === 'string' && item.displayName.trim().length
-              ? item.displayName
-              : item.name;
+        if (typeof item === 'string') tabs.push({ name: item, displayName: item });
+        else if (item && typeof item === 'object' && typeof item.name === 'string') {
+          const dn = typeof item.displayName === 'string' && item.displayName.trim().length ? item.displayName : item.name;
           tabs.push({ name: item.name, displayName: dn });
         }
       }
       return { tabs, active };
     }
-  } catch {
-    /* ignore */
-  }
+  } catch { /* ignore */ }
   return { tabs: [], active: null };
 }
 
 // ---------------------------------------------------------------------------
-// Cross-device sync: the server holds the authoritative tab list (which
-// sessions exist + their display names), so opening the page on any platform
-// shows the same tabs. localStorage is now only a per-device cache (offline
-// fallback + which tab this device last had focused).
+// Cross-device sync
 // ---------------------------------------------------------------------------
-
-// Sessions just closed on this device; suppress a racing server sync from
-// re-adding them before the kill is reflected server-side. Expired in sync().
 const recentlyClosed = new Map<string, number>();
 const CLOSE_GUARD_MS = 6000;
 
-// Fetch the server's tab list. Returns null (and we keep local state) if the
-// server is unreachable or slow, so a flaky network never blanks the tabs.
 async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
   const ctrl = new AbortController();
   const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
@@ -1246,311 +1300,606 @@ async function fetchServerTabs(timeoutMs = 2500): Promise<SavedTab[] | null> {
       }
     }
     return out;
-  } catch {
-    return null;
-  } finally {
-    window.clearTimeout(timer);
-  }
+  } catch { return null; } finally { window.clearTimeout(timer); }
 }
 
-// Best-effort: tell the server a tab was renamed so other devices pick it up.
-// The local label is already updated; a failure just delays cross-device sync.
 function renameOnServer(name: string, displayName: string): void {
   void fetch('/api/sessions/rename', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ name, displayName }),
-  }).catch(() => {
-    /* ignore — local UI already reflects the change */
-  });
+  }).catch(() => { /* ignore */ });
 }
 
-// Tear down a tab whose session was closed on another device. Unlike
-// closeSession this sends NO kill (the session is already gone server-side) —
-// it just removes the tab and frees the terminal locally.
 function removeLocalSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
   sessions.splice(idx, 1);
-  s.tabEl?.remove();
   s.dispose();
   if (activeSession === s) {
     activeSession = null;
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
   }
+  renderTabs();
   refreshMobileUI();
 }
 
 let syncing = false;
-
-// Reconcile our local tabs with the server's list: adopt sessions opened (or
-// renamed) on other devices, drop sessions closed elsewhere. The active tab is
-// per-device and never changed here unless its session disappeared.
 async function syncFromServer(): Promise<void> {
   if (syncing) return;
   syncing = true;
   try {
     const serverTabs = await fetchServerTabs();
-    if (!serverTabs) return; // unreachable — keep what we have
+    if (!serverTabs) return;
     const byName = new Map(serverTabs.map((t) => [t.name, t]));
-
-    // Expire stale close-guards first so re-opening a name later still works.
     const now = performance.now();
-    for (const [name, at] of recentlyClosed) {
-      if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name);
-    }
-
-    // Add tabs opened elsewhere; adopt display-name changes from elsewhere.
+    for (const [name, at] of recentlyClosed) { if (now - at > CLOSE_GUARD_MS) recentlyClosed.delete(name); }
     for (const t of serverTabs) {
-      if (recentlyClosed.has(t.name)) continue; // don't resurrect a just-closed tab
+      if (recentlyClosed.has(t.name)) continue;
       const existing = sessions.find((s) => s.name === t.name);
-      if (!existing) {
-        addSession(t.name, false, t.displayName);
-      } else if (t.displayName && t.displayName !== existing.displayName) {
-        setDisplayName(existing, t.displayName);
-      }
+      if (!existing) addSession(t.name, false, t.displayName);
+      else if (t.displayName && t.displayName !== existing.displayName) setDisplayName(existing, t.displayName);
     }
-
-    // Remove tabs closed elsewhere. Only sessions that have actually connected
-    // (so the server knows them) are eligible — never a still-connecting new tab.
     for (const s of sessions.slice()) {
       if (byName.has(s.name)) continue;
       if (!s.everConnected) continue;
       if (recentlyClosed.has(s.name)) continue;
       removeLocalSession(s);
     }
-
     if (sessions.length === 0) addSession(defaultSessionName, true);
     saveTabs();
-  } finally {
-    syncing = false;
-  }
+  } finally { syncing = false; }
 }
 
 // ---------------------------------------------------------------------------
-// Layout: key bar height + iOS keyboard offset; fit the active session.
+// Layout helpers
 // ---------------------------------------------------------------------------
 function fitActive(): void {
-  activeSession?.fit();
+  const td = activeTabData();
+  if (!td) { activeSession?.fit(); return; }
+  // Fit all visible terminals in the current tab's split tree
+  const fitAll = (node: SplitTree): void => {
+    if (node.type === 'leaf') { (node as SplitLeaf).session?.fit(); }
+    else { for (const c of (node as SplitNode).children) fitAll(c); }
+  };
+  fitAll(td.root);
 }
 
-// Below this width the key bar wraps to several rows (see styles.css) instead
-// of being one horizontally-scrollable row, so its height is no longer fixed.
 const mobileMQ = window.matchMedia('(max-width: 640px)');
 
-// Publish the key bar's real height into --keybar-h so the terminal sits right
-// above it: a fixed value on desktop (single row), the measured wrapped height
-// on a phone.
 function updateKeybarHeight(): void {
-  if (keybarEl.classList.contains('hidden')) {
-    root.style.setProperty('--keybar-h', '0px');
-    return;
-  }
+  if (keybarEl.classList.contains('hidden')) { root.style.setProperty('--keybar-h', '0px'); return; }
   const h = mobileMQ.matches ? keybarEl.offsetHeight : KEYBAR_HEIGHT;
   root.style.setProperty('--keybar-h', `${h}px`);
 }
 
 function setKeybarVisible(visible: boolean): void {
   keybarEl.classList.toggle('hidden', !visible);
-  keysBtn.classList.toggle('active', visible);
+  keysBtn?.classList.toggle('active', visible);
   refreshMobileUI();
-  try {
-    localStorage.setItem('tw.keybar', visible ? '1' : '0');
-  } catch {
-    /* ignore */
-  }
-  requestAnimationFrame(() => {
-    updateKeybarHeight();
-    fitActive();
-  });
+  try { localStorage.setItem('tw.keybar', visible ? '1' : '0'); } catch { /* ignore */ }
+  requestAnimationFrame(() => { updateKeybarHeight(); fitActive(); });
 }
 
 function updateKeyboardOffset(): void {
   const vv = window.visualViewport;
   const raw = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
-  // Only a real soft keyboard (>~250px) takes up meaningful height. In a
-  // standalone PWA, window.innerHeight includes the status-bar + home-indicator
-  // areas that visualViewport.height excludes, so with no keyboard `raw` is the
-  // safe-area sum (~95–110px) — ignore anything below 150px so that isn't
-  // mistaken for a keyboard and left as a gap at the bottom.
   const offset = raw > 150 ? raw : 0;
   root.style.setProperty('--kb-offset', `${offset}px`);
   if (VV_DEBUG && vv) {
-    activeSession?.debugSend(
-      'vv',
-      `ih=${window.innerHeight} vvh=${Math.round(vv.height)} ` +
-        `vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} ` +
-        `raw=${Math.round(raw)} off=${Math.round(offset)}`,
-    );
+    activeSession?.debugSend('vv', `ih=${window.innerHeight} vvh=${Math.round(vv.height)} vvTop=${Math.round(vv.offsetTop)} pageY=${Math.round(window.pageYOffset)} raw=${Math.round(raw)} off=${Math.round(offset)}`);
   }
   fitActive();
 }
 
-// ---------------------------------------------------------------------------
-// Top-bar controls + on-screen key bar
-// ---------------------------------------------------------------------------
-function makeButton(
-  parent: HTMLElement,
-  cls: string,
-  label: string,
-  title: string,
-  onTap: () => void,
-): HTMLButtonElement {
-  const b = document.createElement('button');
-  b.className = cls;
-  b.type = 'button';
-  b.textContent = label;
-  b.title = title;
-  b.setAttribute('aria-label', title);
-  // pointerdown + preventDefault keeps focus on the terminal so the iPad soft
-  // keyboard doesn't dismiss; the action runs here for a snappy feel.
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
-  parent.append(b);
-  return b;
-}
-
-function changeFont(delta: number): void {
-  currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
-  try {
-    localStorage.setItem('tw.fontSize', String(currentFont));
-  } catch {
-    /* ignore */
+function updateStatusBar(): void {
+  if (activeSession) {
+    connDot.classList.toggle('reconnecting', !activeSession.connected);
+    connDot.style.background = activeSession.connected ? '#86efac' : '#f0b429';
+    connLabel.textContent = activeSession.connected ? 'connected' : 'reconnecting...';
+    layoutLabel.textContent = '1 panel';
   }
-  for (const s of sessions) s.setFont(currentFont);
-  activeSession?.focus();
 }
 
+// ---------------------------------------------------------------------------
+// Toolbar buttons (reference design)
+// ---------------------------------------------------------------------------
+// Layout buttons (real split actions)
+document.getElementById('layoutSingle')?.addEventListener('click', () => { const td = activeTabData(); if (td) { setSingleLayout(td); showToast('Single layout'); } });
+document.getElementById('layoutV')?.addEventListener('click', () => { const td = activeTabData(); if (td) { splitPaneId(td, td.focused, 'row'); showToast('Split right'); } });
+document.getElementById('layoutH')?.addEventListener('click', () => { const td = activeTabData(); if (td) { splitPaneId(td, td.focused, 'col'); showToast('Split bottom'); } });
+document.getElementById('layoutGrid')?.addEventListener('click', () => { const td = activeTabData(); if (td) { setGridLayout(td); showToast('Grid 2x2'); } });
+
+// Clear
+document.getElementById('clearBtn')?.addEventListener('click', () => {
+  activeSession?.term.clear();
+  showToast('Panel cleared');
+});
+
+// Fullscreen
+document.getElementById('fullscreenBtn')?.addEventListener('click', toggleFullscreen);
 function toggleFullscreen(): void {
-  const d = document as Document & {
-    webkitFullscreenElement?: Element;
-    webkitExitFullscreen?: () => void;
-  };
+  const d = document as Document & { webkitFullscreenElement?: Element; webkitExitFullscreen?: () => void };
   const el = root as HTMLElement & { webkitRequestFullscreen?: () => void };
-  if (!document.fullscreenElement && !d.webkitFullscreenElement) {
-    (el.requestFullscreen ?? el.webkitRequestFullscreen)?.call(el);
-  } else {
-    (document.exitFullscreen ?? d.webkitExitFullscreen)?.call(document);
-  }
+  if (!document.fullscreenElement && !d.webkitFullscreenElement) (el.requestFullscreen ?? el.webkitRequestFullscreen)?.call(el);
+  else (document.exitFullscreen ?? d.webkitExitFullscreen)?.call(document);
   setTimeout(() => fitActive(), 100);
 }
 
-addBtn.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  promptAddSession();
-});
+// Settings button
+document.getElementById('settingsBtn')?.addEventListener('click', openDrawer);
 
-// Sessions list (opens the same bottom-sheet drawer the phone bar uses). On a
-// tablet the top #tabs strip turns into a long horizontal scroll that's awkward
-// to swipe through once there are many tabs; this gives a one-tap vertical
-// picker instead. Hidden on phones (<=640px), which already have a ☰ in
-// #mobilebar; shown on tablet/desktop where the drawer CSS is global anyway.
-makeButton(controlsEl, 'tb-btn tb-icon', '☰', 'Sessions', () => openDrawer());
-makeButton(controlsEl, 'tb-btn', 'A−', 'Smaller font', () => changeFont(-1));
-makeButton(controlsEl, 'tb-btn', 'A+', 'Larger font', () => changeFont(1));
-const keysBtn = makeButton(controlsEl, 'tb-btn tb-icon', '⌨', 'Toggle on-screen keys', () => {
-  setKeybarVisible(keybarEl.classList.contains('hidden'));
-  activeSession?.focus();
-});
-makeButton(controlsEl, 'tb-btn tb-icon', '⟳', 'Restart this session', () => {
-  activeSession?.restart();
-  activeSession?.focus();
-});
+// Add tab button
+document.getElementById('addTab')?.addEventListener('click', openNewTabModal);
 
-// Reliable file attach for every platform (incl. iPad) and over plain HTTP —
-// no clipboard needed: pick any file(s), each uploads and its path is inserted.
-const fileInput = document.createElement('input');
-fileInput.type = 'file';
-fileInput.multiple = true;
-fileInput.style.display = 'none';
-document.body.append(fileInput);
-fileInput.addEventListener('change', () => {
-  if (fileInput.files) {
-    for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name);
+// ---------------------------------------------------------------------------
+// Search (Ctrl+F or click search box)
+// ---------------------------------------------------------------------------
+let searchOverlay: HTMLDivElement | null = null;
+
+function openSearch(): void {
+  if (searchOverlay) { const inp = searchOverlay.querySelector('.search-input') as HTMLInputElement; inp.focus(); inp.select(); return; }
+  searchOverlay = document.createElement('div');
+  searchOverlay.className = 'search-overlay';
+  searchOverlay.innerHTML = `
+    <div class="search-bar" style="flex-direction:column;align-items:stretch;min-width:300px;">
+      <div style="display:flex;align-items:center;gap:4px;">
+        <input type="text" class="search-input" style="flex:1;" placeholder="Search sessions or terminal text..." autocomplete="off" spellcheck="false" />
+        <span class="search-count" id="searchCount"></span>
+        <button class="search-nav" data-dir="prev" title="Previous (Shift+Enter)">&uarr;</button>
+        <button class="search-nav" data-dir="next" title="Next (Enter)">&darr;</button>
+        <button class="search-close" title="Close (Escape)">&times;</button>
+      </div>
+      <div class="search-session-list" style="display:none;margin-top:6px;max-height:200px;overflow-y:auto;border-top:1px solid var(--border-soft);padding-top:4px;"></div>
+    </div>`;
+  document.querySelector('.workspace')?.prepend(searchOverlay);
+  const searchInput = searchOverlay.querySelector('.search-input') as HTMLInputElement;
+  const searchCount = searchOverlay.querySelector('#searchCount') as HTMLElement;
+  const sessionList = searchOverlay.querySelector('.search-session-list') as HTMLDivElement;
+
+  function renderSessionList(query: string): void {
+    if (!query.trim()) { sessionList.style.display = 'none'; sessionList.innerHTML = ''; return; }
+    const q = query.toLowerCase();
+    const matches = sessions.filter((s) => s.displayName.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
+    if (matches.length === 0) { sessionList.style.display = 'none'; sessionList.innerHTML = ''; return; }
+    sessionList.style.display = 'block';
+    sessionList.innerHTML = '';
+    for (const s of matches) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--font-mono);color:var(--text);';
+      row.addEventListener('mouseenter', () => { row.style.background = 'rgba(255,255,255,.06)'; });
+      row.addEventListener('mouseleave', () => { row.style.background = ''; });
+      const dot = document.createElement('span');
+      dot.style.cssText = `width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${s.connected ? 'var(--accent)' : 'var(--dim)'};`;
+      const label = document.createElement('span');
+      label.textContent = s.displayName;
+      label.style.overflow = 'hidden';
+      label.style.textOverflow = 'ellipsis';
+      label.style.whiteSpace = 'nowrap';
+      row.append(dot, label);
+      row.addEventListener('click', () => { activateSession(s); closeSearch(); });
+      sessionList.appendChild(row);
+    }
   }
-  fileInput.value = '';
-});
-// Monochrome paperclip icon (matches the other glyphs; uses currentColor).
-const fileBtn = document.createElement('button');
-fileBtn.className = 'tb-btn tb-icon';
-fileBtn.type = 'button';
-fileBtn.title = 'Attach a file (upload + insert path)';
-fileBtn.setAttribute('aria-label', 'Attach a file');
-fileBtn.innerHTML =
-  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
-  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 ' +
-  '5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>';
-// Use a real click (not pointerdown+preventDefault): iOS blocks opening a file
-// picker from a preventDefaulted pointer event, so the attach button did nothing
-// on phones.
-fileBtn.addEventListener('click', () => fileInput.click());
-controlsEl.append(fileBtn);
 
-// Reverse of the attach button: pull a file OFF the host back to this device.
-// A tray-with-down-arrow glyph, monochrome like the paperclip.
-const dlBtn = document.createElement('button');
-dlBtn.className = 'tb-btn tb-icon';
-dlBtn.type = 'button';
-dlBtn.title = 'Download a file from the host';
-dlBtn.setAttribute('aria-label', 'Download a file from the host');
-dlBtn.innerHTML =
-  '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" ' +
-  'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
-  '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>' +
-  '<polyline points="7 10 12 15 17 10"></polyline>' +
-  '<line x1="12" y1="15" x2="12" y2="3"></line></svg>';
-dlBtn.addEventListener('click', () => {
-  void (async () => {
-    const p = await domPrompt({
-      label: 'Download a file from the host — enter its full path',
-      value: '~/',
-      okText: 'Download',
-    });
-    if (p) void downloadFromHost(p);
-  })();
-});
-controlsEl.append(dlBtn);
+  let debounceTimer: ReturnType<typeof setTimeout>;
+  const doSearch = (forward: boolean): void => {
+    const q = searchInput.value;
+    if (!q || !activeSession) { searchCount.textContent = ''; return; }
+    const addon = activeSession.searchAddon;
+    const found = forward ? addon.findNext(q) : addon.findPrevious(q);
+    searchCount.textContent = found ? '' : 'No match';
+  };
 
-makeButton(controlsEl, 'tb-btn tb-icon', '⤢', 'Toggle fullscreen', toggleFullscreen);
-makeButton(controlsEl, 'tb-btn tb-icon', '?', 'Help: copy / paste / files', openHelp);
-
-// --- on-screen key bar (sends to the active session) -----------------------
-interface KeyDef {
-  label?: string;
-  seq?: string;
-  mod?: 'ctrl' | 'alt';
-  action?: 'copy' | 'paste' | 'select';
-  /** Force a line break here (mobile only): the keys after it wrap to a new row. */
-  rowBreak?: boolean;
+  searchInput.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      renderSessionList(searchInput.value);
+      // Fall through to xterm text search if no session matches
+      const hasSessionMatch = sessionList.style.display !== 'none' && sessionList.children.length > 0;
+      if (!hasSessionMatch) doSearch(true);
+    }, 150);
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const firstRow = sessionList.querySelector('div') as HTMLElement | null;
+      if (sessionList.style.display !== 'none' && firstRow) { firstRow.click(); return; }
+      doSearch(!e.shiftKey);
+    }
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+  });
+  searchOverlay.querySelector('.search-nav[data-dir="next"]')?.addEventListener('click', () => doSearch(true));
+  searchOverlay.querySelector('.search-nav[data-dir="prev"]')?.addEventListener('click', () => doSearch(false));
+  searchOverlay.querySelector('.search-close')?.addEventListener('click', closeSearch);
+  setTimeout(() => { searchInput.focus(); searchInput.select(); }, 0);
 }
+
+function closeSearch(): void {
+  if (searchOverlay) { searchOverlay.remove(); searchOverlay = null; }
+  activeSession?.searchAddon.clearDecorations();
+  activeSession?.focus();
+}
+
+document.querySelector('.search-box')?.addEventListener('click', openSearch);
+
+// ---------------------------------------------------------------------------
+// Settings drawer
+// ---------------------------------------------------------------------------
+let drawerTab = 'appearance';
+
+function openDrawer(): void {
+  renderDrawer();
+  overlayEl.classList.add('open');
+  drawerEl.classList.add('open');
+}
+function closeDrawer(): void {
+  overlayEl.classList.remove('open');
+  drawerEl.classList.remove('open');
+  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
+}
+overlayEl.addEventListener('click', closeDrawer);
+document.getElementById('closeDrawer')?.addEventListener('click', closeDrawer);
+
+// Drawer tab switching
+drawerTabsEl.addEventListener('click', (e) => {
+  const tab = (e.target as HTMLElement).closest('.dtab');
+  if (tab) {
+    drawerTab = (tab as HTMLElement).dataset.tab ?? 'appearance';
+    renderDrawer();
+  }
+});
+
+function renderDrawer(): void {
+  // Update active tab state
+  drawerTabsEl.querySelectorAll('.dtab').forEach((b) => {
+    b.classList.toggle('active', (b as HTMLElement).dataset.tab === drawerTab);
+  });
+
+  if (drawerTab === 'appearance') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">Theme</div>
+        <div class="theme-grid" id="themeGrid"></div>
+        <div class="color-grid" id="customColors" style="display:none"></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Typography</div>
+        <div class="row"><label>Terminal font</label>
+          <select id="fontSelect">
+            ${['JetBrains Mono', 'Fira Code', 'Cascadia Code', 'IBM Plex Mono'].map((f) => `<option ${settings.font === f ? 'selected' : ''}>${f}</option>`).join('')}
+          </select>
+        </div>
+        <div class="row"><label>Font size<span class="hint">${settings.fontSize}px</span></label>
+          <input type="range" id="fontSize" min="11" max="20" value="${settings.fontSize}">
+        </div>
+        <div class="row"><label>Line height<span class="hint">${settings.lineHeight.toFixed(1)}</span></label>
+          <input type="range" id="lineHeight" min="1.1" max="2" step="0.1" value="${settings.lineHeight}">
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-title">Cursor</div>
+        <div class="row"><label>Cursor style</label>
+          <div class="seg" id="cursorSeg">
+            ${['bar', 'block', 'underline'].map((s) => `<button data-v="${s}" class="${settings.cursorStyle === s ? 'active' : ''}">${s}</button>`).join('')}
+          </div>
+        </div>
+        <div class="row"><label>Blink cursor</label>
+          <div class="switch ${settings.cursorBlink ? 'on' : ''}" id="blinkSwitch"></div>
+        </div>
+      </div>`;
+
+    // Theme grid
+    const grid = document.getElementById('themeGrid')!;
+    for (const key of ['aurora', 'nord', 'solaris', 'ink']) {
+      const t = THEMES[key];
+      const card = document.createElement('div');
+      card.className = 'theme-card' + (key === currentTheme ? ' selected' : '');
+      card.innerHTML = `<div class="swatch-row">
+          <div class="swatch" style="background:${t.bg}"></div>
+          <div class="swatch" style="background:${t.accent}"></div>
+          <div class="swatch" style="background:${t.accent2}"></div>
+        </div><div class="theme-name">${t.name}</div>`;
+      card.addEventListener('click', () => { applyTheme(key); showToast(`Theme: ${t.name}`); });
+      grid.appendChild(card);
+    }
+    // Custom theme card
+    const customCard = document.createElement('div');
+    customCard.id = 'customThemeCard';
+    customCard.className = 'theme-card' + (currentTheme === 'custom' ? ' selected' : '');
+    customCard.innerHTML = `<div class="swatch-row">
+        <div class="swatch sw-bg" style="background:${THEMES.custom.bg}"></div>
+        <div class="swatch sw-accent" style="background:${THEMES.custom.accent}"></div>
+        <div class="swatch sw-accent2" style="background:${THEMES.custom.accent2}"></div>
+      </div><div class="theme-name">Custom</div>`;
+    customCard.addEventListener('click', () => { applyTheme('custom'); renderDrawer(); showToast('Custom theme active — edit colors below'); });
+    grid.appendChild(customCard);
+
+    // Custom color pickers
+    const colorGrid = document.getElementById('customColors')!;
+    if (currentTheme === 'custom') {
+      colorGrid.style.display = 'grid';
+      const fields: [keyof ThemeDef, string][] = [
+        ['bg', 'Background'], ['panel', 'Panel'], ['pane', 'Terminal'], ['border', 'Border'],
+        ['text', 'Text'], ['muted', 'Muted'], ['accent', 'Accent'], ['accent2', 'Accent 2'],
+      ];
+      colorGrid.innerHTML = fields.map(([key, label]) => `
+        <label class="color-field"><span>${label}</span><input type="color" data-key="${key}" value="${THEMES.custom[key]}"></label>`).join('');
+      colorGrid.querySelectorAll('input[type=color]').forEach((inp) => {
+        inp.addEventListener('input', (e) => {
+          const target = e.target as HTMLInputElement;
+          const key = target.dataset.key as keyof ThemeDef;
+          if (key) { (THEMES.custom as unknown as Record<string, string>)[key] = target.value; applyCustomLive(); }
+        });
+      });
+    }
+
+    // Font select
+    document.getElementById('fontSelect')?.addEventListener('change', (e) => {
+      settings.font = (e.target as HTMLSelectElement).value;
+      for (const s of sessions) s.term.options.fontFamily = `'${settings.font}', monospace`;
+      activeSession?.fit();
+    });
+    // Font size
+    document.getElementById('fontSize')?.addEventListener('input', (e) => {
+      settings.fontSize = +(e.target as HTMLInputElement).value;
+      currentFont = settings.fontSize;
+      for (const s of sessions) s.setFont(settings.fontSize);
+      renderDrawer();
+    });
+    // Line height
+    document.getElementById('lineHeight')?.addEventListener('input', (e) => {
+      settings.lineHeight = +(e.target as HTMLInputElement).value;
+      for (const s of sessions) s.term.options.lineHeight = settings.lineHeight;
+      activeSession?.fit();
+      renderDrawer();
+    });
+    // Cursor style
+    document.getElementById('cursorSeg')?.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('[data-v]') as HTMLElement;
+      if (btn) {
+        settings.cursorStyle = btn.dataset.v as typeof settings.cursorStyle;
+        for (const s of sessions) s.term.options.cursorStyle = settings.cursorStyle;
+        renderDrawer();
+      }
+    });
+    // Cursor blink
+    document.getElementById('blinkSwitch')?.addEventListener('click', () => {
+      settings.cursorBlink = !settings.cursorBlink;
+      for (const s of sessions) s.term.options.cursorBlink = settings.cursorBlink;
+      renderDrawer();
+    });
+  }
+
+  if (drawerTab === 'behavior') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">General</div>
+        <div class="row"><label>Confirm before closing tab<span class="hint">Shows a dialog when closing tabs with running processes</span></label>
+          <div class="switch ${settings.confirmClose ? 'on' : ''}" id="confirmSwitch"></div>
+        </div>
+        <div class="row"><label>Bell sound<span class="hint">Beep when terminal BEL character is received</span></label>
+          <div class="switch ${settings.bellSound ? 'on' : ''}" id="bellSwitch"></div>
+        </div>
+      </div>`;
+    document.getElementById('confirmSwitch')?.addEventListener('click', () => { settings.confirmClose = !settings.confirmClose; renderDrawer(); });
+    document.getElementById('bellSwitch')?.addEventListener('click', () => { settings.bellSound = !settings.bellSound; renderDrawer(); });
+  }
+
+  if (drawerTab === 'keybinds') {
+    drawerBody.innerHTML = `
+      <div class="section">
+        <div class="section-title">Tab & panel navigation</div>
+        <div id="kbList"></div>
+        <a class="reset-link" id="resetKb">Reset to defaults</a>
+      </div>`;
+    const list = document.getElementById('kbList')!;
+    const KB_LABELS: Record<string, [string, string]> = {
+      newTab: ['New tab', 'Open a new terminal tab'],
+      closeTab: ['Close tab', 'Close the active tab'],
+      nextTab: ['Next tab', 'Switch to the next tab'],
+      prevTab: ['Previous tab', 'Switch to the previous tab'],
+      splitRight: ['Split right', 'Split focused pane vertically'],
+      splitDown: ['Split down', 'Split focused pane horizontally'],
+      singleLayout: ['Single layout', 'Merge to one pane (close others)'],
+      clearPane: ['Clear pane', 'Clear the focused pane content'],
+    };
+    for (const [action, [label, desc]] of Object.entries(KB_LABELS)) {
+      const row = document.createElement('div');
+      row.className = 'keybind-row';
+      row.innerHTML = `<div><div class="kb-label">${label}</div><div class="kb-desc">${desc}</div></div>
+        <button class="kb-badge" data-action="${action}">${keybinds[action]}</button>`;
+      list.appendChild(row);
+    }
+    list.addEventListener('click', (e) => {
+      const btn = (e.target as HTMLElement).closest('.kb-badge') as HTMLElement;
+      if (btn) startRecording(btn, btn.dataset.action!);
+    });
+    document.getElementById('resetKb')?.addEventListener('click', () => {
+      keybinds.newTab = 'Ctrl+T';
+      keybinds.closeTab = 'Ctrl+W';
+      keybinds.nextTab = 'Ctrl+Tab';
+      keybinds.prevTab = 'Ctrl+Shift+Tab';
+      keybinds.splitRight = 'Ctrl+Shift+→';
+      keybinds.splitDown = 'Ctrl+Shift+↓';
+      keybinds.singleLayout = 'Ctrl+Shift+↑';
+      keybinds.clearPane = 'Ctrl+K';
+      renderDrawer();
+      showToast('Keybinds reset to defaults');
+    });
+  }
+}
+
+function applyTheme(key: string): void {
+  currentTheme = key;
+  pushCssVars(THEMES[key]);
+  // Update all open terminals
+  for (const s of sessions) {
+    s.term.options.theme = XTERM_THEME as never;
+  }
+  renderDrawer();
+}
+
+function applyCustomLive(): void {
+  currentTheme = 'custom';
+  pushCssVars(THEMES.custom);
+  for (const s of sessions) {
+    s.term.options.theme = XTERM_THEME as never;
+  }
+  const card = document.getElementById('customThemeCard');
+  if (card) {
+    card.classList.add('selected');
+    const swatchBg = card.querySelector('.sw-bg') as HTMLElement | null;
+    const swatchAccent = card.querySelector('.sw-accent') as HTMLElement | null;
+    const swatchAccent2 = card.querySelector('.sw-accent2') as HTMLElement | null;
+    if (swatchBg) swatchBg.style.background = THEMES.custom.bg;
+    if (swatchAccent) swatchAccent.style.background = THEMES.custom.accent;
+    if (swatchAccent2) swatchAccent2.style.background = THEMES.custom.accent2;
+    document.querySelectorAll('.theme-card').forEach((c) => { if (c !== card) c.classList.remove('selected'); });
+  }
+}
+
+// Keybind system
+const keybinds: Record<string, string> = {
+  newTab: 'Ctrl+T',
+  closeTab: 'Ctrl+W',
+  nextTab: 'Ctrl+Tab',
+  prevTab: 'Ctrl+Shift+Tab',
+  splitRight: 'Ctrl+Shift+→',
+  splitDown: 'Ctrl+Shift+↓',
+  singleLayout: 'Ctrl+Shift+↑',
+  clearPane: 'Ctrl+K',
+};
+
+let recordingBtn: HTMLElement | null = null;
+let recordingAction: string | null = null;
+
+function startRecording(btn: HTMLElement, action: string): void {
+  if (recordingBtn) recordingBtn.classList.remove('recording');
+  recordingBtn = btn;
+  recordingAction = action;
+  btn.textContent = 'Press a key...';
+  btn.classList.add('recording');
+}
+function stopRecording(): void {
+  if (recordingBtn) recordingBtn.classList.remove('recording');
+  recordingBtn = null;
+  recordingAction = null;
+}
+
+const ARROW: Record<string, string> = { ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→' };
+function comboFromEvent(e: KeyboardEvent): string {
+  const parts: string[] = [];
+  if (e.ctrlKey) parts.push('Ctrl');
+  if (e.metaKey) parts.push('Cmd');
+  if (e.altKey) parts.push('Alt');
+  if (e.shiftKey) parts.push('Shift');
+  const k = ARROW[e.key] || (e.key.length === 1 ? e.key.toUpperCase() : e.key);
+  if (!['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) parts.push(k);
+  return parts.join('+');
+}
+
+// Global keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  const tag = ((e as KeyboardEvent).target as HTMLElement)?.tagName?.toLowerCase() ?? '';
+  // Keybind recording mode
+  if (recordingAction) {
+    if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+    e.preventDefault();
+    const combo = comboFromEvent(e);
+    keybinds[recordingAction] = combo;
+    showToast(`Keybind: ${combo}`);
+    stopRecording();
+    renderDrawer();
+    return;
+  }
+  if (tag === 'input' || tag === 'textarea') return;
+  // Ctrl+F / Cmd+F — open search
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); openSearch(); return; }
+  const combo = comboFromEvent(e);
+  for (const [action, bound] of Object.entries(keybinds)) {
+    if (bound === combo) {
+      e.preventDefault();
+      runAction(action);
+      return;
+    }
+  }
+});
+
+function runAction(action: string): void {
+  const td = activeTabData();
+  switch (action) {
+    case 'newTab': openNewTabModal(); break;
+    case 'closeTab': if (activeSession) confirmCloseSession(activeSession); break;
+    case 'nextTab': navigateTab(1); break;
+    case 'prevTab': navigateTab(-1); break;
+    case 'splitRight': if (td) { splitPaneId(td, td.focused, 'row'); showToast('Split right'); } break;
+    case 'splitDown': if (td) { splitPaneId(td, td.focused, 'col'); showToast('Split bottom'); } break;
+    case 'singleLayout': if (td) { setSingleLayout(td); showToast('Single layout'); } break;
+    case 'clearPane': if (td) clearFocusedPane(td); break;
+  }
+}
+
+function navigateTab(dir: number): void {
+  if (sessions.length < 2) return;
+  const idx = sessions.findIndex((s) => s === activeSession);
+  const next = sessions[(idx + dir + sessions.length) % sessions.length];
+  if (next) activateSession(next);
+}
+
+// ---------------------------------------------------------------------------
+// New tab modal
+// ---------------------------------------------------------------------------
+function openNewTabModal(): void {
+  newTabInput.value = nextSessionName();
+  modalOverlay.classList.add('open');
+  setTimeout(() => { newTabInput.focus(); newTabInput.select(); }, 50);
+}
+function closeModal(): void { modalOverlay.classList.remove('open'); }
+
+document.getElementById('modalCancel')?.addEventListener('click', closeModal);
+document.getElementById('modalCreate')?.addEventListener('click', confirmNewTab);
+modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+newTabInput.addEventListener('keydown', (e) => {
+  e.stopPropagation();
+  if (e.key === 'Enter') { e.preventDefault(); confirmNewTab(); }
+  if (e.key === 'Escape') { e.preventDefault(); closeModal(); }
+});
+
+function confirmNewTab(): void {
+  const name = newTabInput.value.trim() || nextSessionName();
+  const sanitized = sanitizeName(name) ?? name;
+  const s = addSession(sanitized, true);
+  // Create TabData for the new tab so renderPanes() has a split-tree to render
+  const leafId = paneSeq++;
+  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: leafId, session: s }, focused: leafId };
+  tabDataList.push(td);
+  activeTabId = td.id;
+  renderPanes();
+  closeModal();
+  showToast(`Tab "${sanitized}" created`);
+}
+
+// ---------------------------------------------------------------------------
+// On-screen key bar (touch devices)
+// ---------------------------------------------------------------------------
+interface KeyDef { label?: string; seq?: string; mod?: 'ctrl' | 'alt'; action?: 'copy' | 'paste' | 'select'; rowBreak?: boolean; }
 const KEYS: KeyDef[] = [
-  { label: 'Esc', seq: '\x1b' },
-  { label: 'Tab', seq: '\t' },
-  { label: 'Ctrl', mod: 'ctrl' },
-  { label: 'Alt', mod: 'alt' },
-  { label: '^C', seq: '\x03' },
-  { label: 'Enter', seq: '\r' },
-  // Touch text-selection toggle: while armed, drag on the terminal to select and
-  // lift to copy (a tablet's stand-in for desktop Option-drag selection).
-  { label: '選取', action: 'select' },
-  // On a phone the arrows get their own second row; everything else stays on the first.
+  { label: 'Esc', seq: '\x1b' }, { label: 'Tab', seq: '\t' },
+  { label: 'Ctrl', mod: 'ctrl' }, { label: 'Alt', mod: 'alt' },
+  { label: '^C', seq: '\x03' }, { label: 'Enter', seq: '\r' },
+  { label: 'Select', action: 'select' },
   { rowBreak: true },
-  // Ctrl+End: jump to the bottom in Claude Code's fullscreen view (CSI 1;5F).
-  { label: '^End', seq: '\x1b[1;5F' },
-  { label: '←', seq: '\x1b[D' },
-  { label: '↑', seq: '\x1b[A' },
-  { label: '↓', seq: '\x1b[B' },
-  { label: '→', seq: '\x1b[C' },
+  { label: '←', seq: '\x1b[D' }, { label: '↑', seq: '\x1b[A' },
+  { label: '↓', seq: '\x1b[B' }, { label: '→', seq: '\x1b[C' },
 ];
 
-let ctrlArmed = false;
-let altArmed = false;
+let ctrlArmed = false, altArmed = false;
 const modButtons: Partial<Record<'ctrl' | 'alt', HTMLElement>> = {};
 let selectBtn: HTMLElement | null = null;
+let keysBtn: HTMLButtonElement | null = null;
 
 function refreshModVisuals(): void {
   modButtons.ctrl?.classList.toggle('armed', ctrlArmed);
@@ -1565,10 +1914,7 @@ function applyMods(seq: string): string {
   }
   if (seq.length === 1) {
     let ch = seq;
-    if (ctrlArmed) {
-      const code = ch.toUpperCase().charCodeAt(0);
-      if (code >= 64 && code <= 95) ch = String.fromCharCode(code & 0x1f);
-    }
+    if (ctrlArmed) { const code = ch.toUpperCase().charCodeAt(0); if (code >= 64 && code <= 95) ch = String.fromCharCode(code & 0x1f); }
     if (altArmed) ch = '\x1b' + ch;
     return ch;
   }
@@ -1591,61 +1937,34 @@ for (const def of KEYS) {
   if (def.action === 'select') selectBtn = b;
   b.addEventListener('pointerdown', (e) => {
     e.preventDefault();
-    // On touch, never refocus the terminal: focusing its textarea pops up the
-    // soft keyboard. The keys send their bytes straight over the WebSocket, so
-    // focus isn't needed — preventDefault already keeps whatever focus state
-    // (and thus the keyboard) the user already had.
     const refocus = e.pointerType !== 'touch';
     if (def.action === 'select') {
-      // Toggle touch-select mode. While on, dragging the terminal selects text
-      // (and lifting copies it) instead of scrolling; tap again to go back to
-      // scrolling. Never refocus — that would pop the soft keyboard.
       touchSelectMode = !touchSelectMode;
       selectBtn?.classList.toggle('armed', touchSelectMode);
       if (!touchSelectMode) activeSession?.term.clearSelection();
-      flashStatus(touchSelectMode ? '選取模式:拖曳選字→放開複製' : '選取關閉', 1600);
+      flashStatus(touchSelectMode ? 'Select mode: drag to select, lift to copy' : 'Select off', 1600);
       return;
     }
     if (def.action === 'copy') {
       const sel = activeSession?.term.getSelection() ?? '';
-      if (sel) {
-        void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
-      } else {
-        flashStatus('nothing selected', 1200);
-      }
+      if (sel) void copyText(sel).then((ok) => flashStatus(ok ? 'copied' : 'copy failed', 1200));
+      else flashStatus('nothing selected', 1200);
       if (refocus) activeSession?.focus();
       return;
     }
-    if (def.action === 'paste') {
-      pasteFromClipboard();
-      if (refocus) activeSession?.focus();
-      return;
-    }
-    if (def.mod) {
-      if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed;
-      else altArmed = !altArmed;
-      refreshModVisuals();
-      return;
-    }
+    if (def.action === 'paste') { pasteFromClipboard(); if (refocus) activeSession?.focus(); return; }
+    if (def.mod) { if (def.mod === 'ctrl') ctrlArmed = !ctrlArmed; else altArmed = !altArmed; refreshModVisuals(); return; }
     if (def.seq !== undefined) activeSession?.sendSeq(applyMods(def.seq));
-    if (ctrlArmed || altArmed) {
-      ctrlArmed = false;
-      altArmed = false;
-      refreshModVisuals();
-    }
+    if (ctrlArmed || altArmed) { ctrlArmed = false; altArmed = false; refreshModVisuals(); }
     if (refocus) activeSession?.focus();
   });
   keybarEl.append(b);
 }
 
 // ---------------------------------------------------------------------------
-// Mobile UI: a compact top bar + a bottom "Sessions" drawer + an actions
-// sheet. Built unconditionally; CSS (@media max-width:640px) hides it on
-// desktop and hides the original #topbar on phones. Everything reuses the
-// existing session functions, so the two layouts stay in sync.
+// Mobile UI
 // ---------------------------------------------------------------------------
-const mobilebar = document.createElement('div');
-mobilebar.id = 'mobilebar';
+const mobilebar = document.getElementById('mobilebar')!;
 
 function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElement {
   const b = document.createElement('button');
@@ -1654,14 +1973,11 @@ function mBtn(label: string, title: string, onTap: () => void): HTMLButtonElemen
   b.textContent = label;
   b.title = title;
   b.setAttribute('aria-label', title);
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
   return b;
 }
 
-const mMenuBtn = mBtn('☰', 'Sessions', () => openDrawer());
+const mMenuBtn = mBtn('☰', 'Sessions', () => openMobileDrawer());
 const mTitle = document.createElement('button');
 mTitle.className = 'm-title';
 mTitle.type = 'button';
@@ -1673,13 +1989,19 @@ const mCaret = document.createElement('span');
 mCaret.className = 'm-caret';
 mCaret.textContent = '▾';
 mTitle.append(mTitleDot, mTitleLabel, mCaret);
-mTitle.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  openDrawer();
+mTitle.addEventListener('pointerdown', (e) => { e.preventDefault(); openMobileDrawer(); });
+
+// File attach
+const fileInput = document.createElement('input');
+fileInput.type = 'file';
+fileInput.multiple = true;
+fileInput.style.display = 'none';
+document.body.append(fileInput);
+fileInput.addEventListener('change', () => {
+  if (fileInput.files) { for (const f of Array.from(fileInput.files)) void uploadFile(f, f.name); }
+  fileInput.value = '';
 });
 
-// Built directly (not via mBtn) so it triggers on a real `click`: iOS refuses to
-// open a file picker from a preventDefaulted pointerdown.
 const mAttachBtn = document.createElement('button');
 mAttachBtn.className = 'm-btn';
 mAttachBtn.type = 'button';
@@ -1687,52 +2009,40 @@ mAttachBtn.textContent = '📎';
 mAttachBtn.title = 'Attach a file';
 mAttachBtn.setAttribute('aria-label', 'Attach a file');
 mAttachBtn.addEventListener('click', () => fileInput.click());
-const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => {
-  // No focus() here: on a phone, focusing the terminal pops the soft keyboard,
-  // which defeats the point of toggling the on-screen keys.
-  setKeybarVisible(keybarEl.classList.contains('hidden'));
-});
+const mKeysBtn = mBtn('⌨', 'Toggle on-screen keys', () => { setKeybarVisible(keybarEl.classList.contains('hidden')); });
 const mMoreBtn = mBtn('⋯', 'More actions', () => openSheet());
 
 mobilebar.append(mMenuBtn, mTitle, mAttachBtn, mKeysBtn, mMoreBtn);
-document.body.append(mobilebar);
 
-// --- Sessions drawer (bottom sheet) ----------------------------------------
+// Mobile sessions drawer (bottom sheet)
 const drawerOverlay = document.createElement('div');
 drawerOverlay.className = 'sheet-overlay hidden';
-const drawer = document.createElement('div');
-drawer.className = 'sheet drawer';
+const drawerSheet = document.createElement('div');
+drawerSheet.className = 'sheet';
 const drawerGrip = document.createElement('div');
 drawerGrip.className = 'sheet-grip';
-const drawerTitle = document.createElement('div');
-drawerTitle.className = 'sheet-title';
-drawerTitle.textContent = 'Sessions';
+const drawerSheetTitle = document.createElement('div');
+drawerSheetTitle.className = 'sheet-title';
+drawerSheetTitle.textContent = 'Sessions';
 const drawerList = document.createElement('div');
 drawerList.className = 'drawer-list';
-const drawerNew = document.createElement('button');
-drawerNew.className = 'drawer-new';
-drawerNew.type = 'button';
-drawerNew.textContent = '+  New session';
-drawerNew.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  closeDrawer();
-  promptAddSession();
-});
-drawer.append(drawerGrip, drawerTitle, drawerList, drawerNew);
-drawerOverlay.append(drawer);
+const drawerNewBtn = document.createElement('button');
+drawerNewBtn.className = 'drawer-new';
+drawerNewBtn.type = 'button';
+drawerNewBtn.textContent = '+  New session';
+drawerNewBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); closeMobileDrawer(); openNewTabModal(); });
+drawerSheet.append(drawerGrip, drawerSheetTitle, drawerList, drawerNewBtn);
+drawerOverlay.append(drawerSheet);
 document.body.append(drawerOverlay);
-drawerOverlay.addEventListener('pointerdown', (e) => {
-  if (e.target === drawerOverlay) closeDrawer();
-});
+drawerOverlay.addEventListener('pointerdown', (e) => { if (e.target === drawerOverlay) closeMobileDrawer(); });
 
-let drawerOpen = false;
+let mobileDrawerOpen = false;
 
-function renderDrawer(): void {
+function renderMobileDrawerList(): void {
   drawerList.textContent = '';
   for (const s of sessions) {
     const row = document.createElement('div');
     row.className = 'drawer-row' + (s === activeSession ? ' active' : '');
-
     const body = document.createElement('div');
     body.className = 'drawer-body';
     const dot = document.createElement('span');
@@ -1741,63 +2051,32 @@ function renderDrawer(): void {
     name.className = 'drawer-name';
     name.textContent = s.displayName;
     body.append(dot, name);
-    body.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      activateSession(s);
-      closeDrawer();
-    });
-
+    body.addEventListener('pointerdown', (e) => { e.preventDefault(); activateSession(s); closeMobileDrawer(); });
     const rename = document.createElement('button');
     rename.className = 'drawer-act';
     rename.type = 'button';
     rename.textContent = '✎';
     rename.title = 'Rename tab';
-    rename.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      promptRenameSession(s);
-      renderDrawer();
-    });
-
+    rename.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); promptRenameSession(s); renderMobileDrawerList(); });
     const close = document.createElement('button');
     close.className = 'drawer-act danger';
     close.type = 'button';
     close.textContent = '×';
     close.title = 'Close tab & kill session';
-    close.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      closeDrawer();
-      confirmCloseSession(s);
-    });
-
+    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); closeMobileDrawer(); confirmCloseSession(s); });
     row.append(body, rename, close);
     drawerList.append(row);
   }
 }
 
-function openDrawer(): void {
-  renderDrawer();
-  drawerOverlay.classList.remove('hidden');
-  drawerOpen = true;
-}
-function closeDrawer(): void {
-  drawerOverlay.classList.add('hidden');
-  drawerOpen = false;
-  // Don't focus the terminal on touch: this runs inside the tap gesture that
-  // picked a session, and a synchronous focus() raises the soft keyboard — so
-  // every session switch popped the keyboard. (This, not setActive()'s rAF
-  // focus, was the real culprit: focus() outside a user gesture doesn't raise
-  // the keyboard on iOS.) The drawer is mobile-only, so skip focus entirely on
-  // a coarse pointer; tap the terminal when you actually want to type.
-  if (!window.matchMedia('(pointer: coarse)').matches) activeSession?.focus();
-}
+function openMobileDrawer(): void { renderMobileDrawerList(); drawerOverlay.classList.remove('hidden'); mobileDrawerOpen = true; }
+function closeMobileDrawer(): void { drawerOverlay.classList.add('hidden'); mobileDrawerOpen = false; }
 
-// --- Actions sheet (font / restart / paste / fullscreen / help) ------------
+// Mobile actions sheet
 const sheetOverlay = document.createElement('div');
 sheetOverlay.className = 'sheet-overlay hidden';
 const sheet = document.createElement('div');
-sheet.className = 'sheet actions-sheet';
+sheet.className = 'sheet';
 const sheetGrip = document.createElement('div');
 sheetGrip.className = 'sheet-grip';
 const sheetTitle = document.createElement('div');
@@ -1816,19 +2095,9 @@ const fontPlus = document.createElement('button');
 fontPlus.className = 'sf-btn';
 fontPlus.type = 'button';
 fontPlus.textContent = 'A+';
-function updateFontVal(): void {
-  fontVal.textContent = `Font ${currentFont}px`;
-}
-fontMinus.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  changeFont(-1);
-  updateFontVal();
-});
-fontPlus.addEventListener('pointerdown', (e) => {
-  e.preventDefault();
-  changeFont(1);
-  updateFontVal();
-});
+function updateFontVal(): void { fontVal.textContent = `Font ${currentFont}px`; }
+fontMinus.addEventListener('pointerdown', (e) => { e.preventDefault(); changeFont(-1); updateFontVal(); });
+fontPlus.addEventListener('pointerdown', (e) => { e.preventDefault(); changeFont(1); updateFontVal(); });
 fontRow.append(fontMinus, fontVal, fontPlus);
 
 function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElement {
@@ -1841,200 +2110,93 @@ function sheetRow(ico: string, label: string, onTap: () => void): HTMLButtonElem
   const t = document.createElement('span');
   t.textContent = label;
   b.append(i, t);
-  b.addEventListener('pointerdown', (e) => {
-    e.preventDefault();
-    onTap();
-  });
+  b.addEventListener('pointerdown', (e) => { e.preventDefault(); onTap(); });
   return b;
 }
 
 sheet.append(
-  sheetGrip,
-  sheetTitle,
-  fontRow,
-  sheetRow('⟳', 'Restart this session', () => {
-    closeSheet();
-    activeSession?.restart();
-    activeSession?.focus();
-  }),
-  sheetRow('📋', 'Paste', () => {
-    closeSheet();
-    pasteFromClipboard();
-  }),
-  sheetRow('⤢', 'Toggle fullscreen', () => {
-    closeSheet();
-    toggleFullscreen();
-  }),
-  sheetRow('?', 'Help: copy / paste / files', () => {
-    closeSheet();
-    openHelp();
-  }),
+  sheetGrip, sheetTitle, fontRow,
+  sheetRow('⟳', 'Restart this session', () => { closeSheet(); activeSession?.restart(); activeSession?.focus(); }),
+  sheetRow('📋', 'Paste', () => { closeSheet(); pasteFromClipboard(); }),
+  sheetRow('⬇', 'Download file', () => { closeSheet(); void (async () => { const p = await domPrompt({ label: 'Enter file path to download', value: '~/', okText: 'Download' }); if (p) void downloadFromHost(p); })(); }),
+  sheetRow('⤢', 'Toggle fullscreen', () => { closeSheet(); toggleFullscreen(); }),
+  sheetRow('⚙', 'Settings', () => { closeSheet(); openDrawer(); }),
+  sheetRow('?', 'Help: copy / paste / files', () => { closeSheet(); openHelp(); }),
 );
 sheetOverlay.append(sheet);
 document.body.append(sheetOverlay);
-sheetOverlay.addEventListener('pointerdown', (e) => {
-  if (e.target === sheetOverlay) closeSheet();
-});
+sheetOverlay.addEventListener('pointerdown', (e) => { if (e.target === sheetOverlay) closeSheet(); });
 
-function openSheet(): void {
-  updateFontVal();
-  sheetOverlay.classList.remove('hidden');
-}
-function closeSheet(): void {
-  sheetOverlay.classList.add('hidden');
+function openSheet(): void { updateFontVal(); sheetOverlay.classList.remove('hidden'); }
+function closeSheet(): void { sheetOverlay.classList.add('hidden'); }
+
+function changeFont(delta: number): void {
+  currentFont = Math.min(MAX_FONT, Math.max(MIN_FONT, currentFont + delta));
+  settings.fontSize = currentFont;
+  try { localStorage.setItem('tw.fontSize', String(currentFont)); } catch { /* ignore */ }
+  for (const s of sessions) s.setFont(currentFont);
+  activeSession?.focus();
 }
 
-// Keep the mobile bar's title + connection dot current, and re-render the open
-// drawer when the session list / active tab / connection state changes.
 function refreshMobileUI(): void {
   const s = activeSession;
   mTitleLabel.textContent = s ? s.displayName : '—';
   mTitleDot.classList.toggle('connected', !!s?.connected);
   mKeysBtn.classList.toggle('active', !keybarEl.classList.contains('hidden'));
-  if (drawerOpen) renderDrawer();
-}
-refreshMobileUI();
-
-// ---------------------------------------------------------------------------
-// Global resize handling
-// ---------------------------------------------------------------------------
-window.addEventListener('resize', () => {
-  updateKeybarHeight(); // rows may re-wrap when the width changes
-  fitActive();
-});
-// Re-measure when crossing the mobile breakpoint (e.g. rotating the phone),
-// since the key bar switches between a fixed row and the wrapped layout.
-mobileMQ.addEventListener('change', () => {
-  updateKeybarHeight();
-  fitActive();
-});
-let areaObserver: ResizeObserver | null = null;
-if (typeof ResizeObserver !== 'undefined') {
-  areaObserver = new ResizeObserver(() => fitActive());
-  areaObserver.observe(termArea);
-}
-if (window.visualViewport) {
-  window.visualViewport.addEventListener('resize', updateKeyboardOffset);
-  window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
-  // Baseline snapshot (keyboard closed) once the WS is likely open, so the log
-  // shows the resting numbers before any keyboard event fires.
-  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
-}
-window.addEventListener('beforeunload', () => {
-  for (const s of sessions) s.dispose();
-});
-
-// ---------------------------------------------------------------------------
-// File paste / drag-drop / picker -> upload -> insert the saved path into the
-// active session, so the program running there (e.g. Claude Code) can read it.
-// Any file type works, not just images.
-// ---------------------------------------------------------------------------
-function flashStatus(text: string, ms: number): void {
-  showStatus(text);
-  window.setTimeout(() => {
-    if (statusEl?.textContent === text) hideStatus();
-  }, ms);
+  if (mobileDrawerOpen) renderMobileDrawerList();
 }
 
-function fmtMB(bytes: number): string {
-  return (bytes / (1024 * 1024)).toFixed(1);
-}
-
-// Upload via XMLHttpRequest (not fetch): fetch exposes no upload-progress
-// events, so a big file (e.g. 75 MB) just sat on "uploading…" with no feedback.
-// xhr.upload.onprogress lets us show a live percentage, and parsing the server's
-// JSON {error} surfaces *why* an upload failed (e.g. "file too large") instead
-// of a generic message. Never rejects — always resolves so callers can `void` it.
+// ---------------------------------------------------------------------------
+// File upload / download
+// ---------------------------------------------------------------------------
 function uploadFile(file: Blob, name?: string): Promise<void> {
   return new Promise((resolve) => {
-    if (!file) {
-      resolve();
-      return;
-    }
-    // Bind the destination to the tab that's active NOW, at upload start — the
-    // file belongs to the terminal you attached it from. onload can fire much
-    // later (a big upload, or you switched tabs / backgrounded the app while it
-    // ran); using the live activeSession there sent the path to whatever tab
-    // happened to be active on completion — the wrong one, or none you were
-    // looking at. sendSeq buffers it if that tab's socket is mid-reconnect.
+    if (!file) { resolve(); return; }
     const target = activeSession;
     const label = name ?? 'file';
-    showStatus(`uploading ${label}… 0%`);
-
+    showStatus(`uploading ${label}... 0%`);
     const xhr = new XMLHttpRequest();
     xhr.open('POST', '/upload' + (name ? `?name=${encodeURIComponent(name)}` : ''));
     xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-
     xhr.upload.onprogress = (e): void => {
       if (e.lengthComputable) {
         const pct = Math.round((e.loaded / e.total) * 100);
-        showStatus(
-          `uploading ${label}… ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`,
-        );
+        showStatus(`uploading ${label}... ${pct}% (${fmtMB(e.loaded)}/${fmtMB(e.total)} MB)`);
       } else {
-        showStatus(`uploading ${label}… ${fmtMB(e.loaded)} MB`);
+        showStatus(`uploading ${label}... ${fmtMB(e.loaded)} MB`);
       }
     };
-    // All bytes are sent; the server is now writing the file and replying.
-    xhr.upload.onload = (): void => showStatus(`uploading ${label}… finishing…`);
-
+    xhr.upload.onload = (): void => showStatus(`uploading ${label}... finishing...`);
     xhr.onload = (): void => {
       let data: { path?: string; error?: string } = {};
-      try {
-        data = JSON.parse(xhr.responseText) as typeof data;
-      } catch {
-        /* non-JSON response */
-      }
+      try { data = JSON.parse(xhr.responseText) as typeof data; } catch { /* non-JSON */ }
       if (xhr.status >= 200 && xhr.status < 300 && data.path) {
         if (target) {
-          // Quote the path if it contains whitespace; append a space so it reads
-          // as a complete argument at the prompt.
-          const p = /\s/.test(data.path)
-            ? `'${data.path.replace(/'/g, `'\\''`)}'`
-            : data.path;
+          const p = /\s/.test(data.path) ? `'${data.path.replace(/'/g, `'\\''`)}'` : data.path;
           target.sendSeq(p + ' ');
           if (isActive(target)) target.focus();
         }
-        // If it landed on a tab you've since switched away from, name it so you
-        // know where the path went instead of it seeming to vanish.
-        const where = target && !isActive(target) ? ` → ${target.displayName}` : '';
+        const where = target && !isActive(target) ? ` -> ${target.displayName}` : '';
         flashStatus(`file added${where}: ${data.path}`, 2500);
       } else {
-        flashStatus(
-          data.error ? `upload failed: ${data.error}` : 'file upload failed',
-          3500,
-        );
+        flashStatus(data.error ? `upload failed: ${data.error}` : 'file upload failed', 3500);
       }
       resolve();
     };
-    xhr.onerror = (): void => {
-      flashStatus('file upload failed', 2500);
-      resolve();
-    };
+    xhr.onerror = (): void => { flashStatus('file upload failed', 2500); resolve(); };
     xhr.send(file);
   });
 }
 
-// Pull a file off the host back to this device — the reverse of uploadFile. A
-// HEAD pre-check turns a bad path into a toast instead of silently saving the
-// server's 404 body as a file; the real GET then streams through a transient
-// <a download> so large files never buffer in memory. Auth rides on the
-// same-origin tw_auth cookie automatically.
 async function downloadFromHost(rawPath: string): Promise<void> {
   const p = rawPath.trim();
   if (!p) return;
   const url = '/api/download?path=' + encodeURIComponent(p);
-  showStatus(`preparing ${p}…`);
+  showStatus(`preparing ${p}...`);
   let head: Response;
-  try {
-    head = await fetch(url, { method: 'HEAD' });
-  } catch {
-    flashStatus('download failed (network)', 2500);
-    return;
-  }
+  try { head = await fetch(url, { method: 'HEAD' }); } catch { flashStatus('download failed (network)', 2500); return; }
   if (!head.ok) {
-    const why =
-      head.status === 404 ? 'not found' : head.status === 400 ? 'bad path' : `error ${head.status}`;
+    const why = head.status === 404 ? 'not found' : head.status === 400 ? 'bad path' : `error ${head.status}`;
     flashStatus(`download failed: ${why}`, 3000);
     return;
   }
@@ -2046,172 +2208,479 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   document.body.append(a);
   a.click();
   a.remove();
-  flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}…`, 2500);
+  flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}...`, 2500);
 }
 
-// Capture phase: xterm's own paste handler calls stopPropagation() on its
-// textarea/element, so a bubble-phase listener would never see pastes made into
-// the focused terminal. Capturing lets us intercept file pastes first. Any file
-// kind is uploaded; plain-text pastes fall through to xterm untouched.
-window.addEventListener(
-  'paste',
-  (e: ClipboardEvent) => {
-    const items = e.clipboardData?.items;
-    if (PASTE_DEBUG) {
-      const cd = e.clipboardData;
-      let kinds = '(no items)';
-      if (items) {
-        const parts: string[] = [];
-        for (let i = 0; i < items.length; i += 1) parts.push(`${items[i].kind}/${items[i].type}`);
-        kinds = parts.length ? parts.join(',') : '(empty)';
-      }
-      const types = cd && cd.types ? Array.from(cd.types).join('|') : '(none)';
-      activeSession?.debugSend(
-        'paste',
-        `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`,
-      );
-    }
-    const dt = e.clipboardData;
-    if (!dt) return;
+// ---------------------------------------------------------------------------
+// File Manager
+// ---------------------------------------------------------------------------
+const fmPanel = document.getElementById('fmPanel')!;
+const fmOverlay = document.getElementById('fmOverlay')!;
+const fmBreadcrumb = document.getElementById('fmBreadcrumb')!;
+const fmList = document.getElementById('fmList')!;
+const fmPreview = document.getElementById('fmPreview')!;
+const fmPreviewName = document.getElementById('fmPreviewName')!;
+const fmPreviewContent = document.getElementById('fmPreviewContent')!;
+const fmFileInput = document.getElementById('fmFileInput') as HTMLInputElement;
+let fmCurrentPath = '~';
+let fmOpen = false;
 
-    // (1) Real file items — macOS image paste, Win+Shift+S screenshots, any
-    // copied file (any type is allowed). (2) Fall back to dt.files, which some
-    // browsers populate even when the items list doesn't expose the file.
-    const files: File[] = [];
-    if (items) {
-      for (let i = 0; i < items.length; i += 1) {
-        if (items[i].kind === 'file') {
-          const f = items[i].getAsFile();
-          if (f) files.push(f);
-        }
-      }
+function openFm(): void {
+  fmOpen = true;
+  fmPanel.classList.add('open');
+  fmOverlay.classList.add('open');
+  void loadFmDir(fmCurrentPath);
+}
+function closeFm(): void {
+  fmOpen = false;
+  fmPanel.classList.remove('open');
+  fmOverlay.classList.remove('open');
+  fmPreview.classList.add('hidden');
+  activeSession?.focus();
+}
+
+// Open/close
+document.getElementById('filesBtn')?.addEventListener('click', openFm);
+fmOverlay.addEventListener('click', closeFm);
+document.getElementById('fmCloseBtn')?.addEventListener('click', closeFm);
+
+// Refresh
+document.getElementById('fmRefreshBtn')?.addEventListener('click', () => void loadFmDir(fmCurrentPath));
+
+// Escape to close
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && fmOpen) { closeFm(); e.preventDefault(); e.stopPropagation(); }
+});
+
+// --- Breadcrumb rendering ---
+function renderFmBreadcrumb(absPath: string): void {
+  fmBreadcrumb.innerHTML = '';
+  // Show home as ~
+  const home = absPath.replace(/^\/home\/[^/]+/, '~');
+  const parts = home.split('/').filter(Boolean);
+  let accumulated = parts[0] === '~' ? '~' : '/' + parts[0];
+
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      accumulated += '/' + parts[i];
+      const sep = document.createElement('span');
+      sep.className = 'fm-sep';
+      sep.textContent = '/';
+      fmBreadcrumb.appendChild(sep);
     }
-    if (files.length === 0 && dt.files) {
-      for (let i = 0; i < dt.files.length; i += 1) files.push(dt.files[i]);
-    }
-    if (files.length > 0) {
-      e.preventDefault();
-      e.stopImmediatePropagation(); // don't let xterm also handle it
-      for (const f of files) void uploadFile(f, f.name);
+    const crumb = document.createElement('span');
+    crumb.className = 'fm-crumb' + (i === parts.length - 1 ? ' active' : '');
+    crumb.textContent = parts[i];
+    const targetPath = accumulated;
+    crumb.addEventListener('click', () => void loadFmDir(targetPath));
+    fmBreadcrumb.appendChild(crumb);
+  }
+}
+
+// --- File size formatting ---
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// --- Load directory ---
+async function loadFmDir(dirPath: string): Promise<void> {
+  fmCurrentPath = dirPath;
+  fmList.innerHTML = '<div class="fm-empty">Loading...</div>';
+  fmPreview.classList.add('hidden');
+  try {
+    const res = await fetch('/api/files?path=' + encodeURIComponent(dirPath));
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      fmList.innerHTML = `<div class="fm-empty">${msg}</div>`;
       return;
     }
-
-    // (3) Windows-Chrome case: copying an image from a web page (or Office)
-    // often delivers it ONLY as text/html (an <img src="data:...">) with NO
-    // file item, so the checks above find nothing. Recover the embedded image
-    // by parsing the HTML and fetching a data:/blob: src into a Blob. Remote
-    // http(s)/file: srcs can't be fetched client-side (CORS/security), so those
-    // fall through to xterm's normal text paste.
-    const html = dt.getData ? dt.getData('text/html') : '';
-    if (html) {
-      const src =
-        new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') ??
-        '';
-      if (src.startsWith('data:image/') || src.startsWith('blob:')) {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        void (async () => {
-          try {
-            const blob = await fetch(src).then((r) => r.blob());
-            if (blob.type.startsWith('image/')) {
-              const ext = (blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
-              await uploadFile(blob, `pasted-image.${ext}`);
-            }
-          } catch {
-            flashStatus('paste: could not read the image', 2500);
-          }
-        })();
-        return;
-      }
-      if (PASTE_DEBUG && src) {
-        activeSession?.debugSend('paste', `unfetchable img src=${src.slice(0, 48)}`);
-      }
+    const data = await res.json() as { path: string; items: { name: string; type: string; size: number; mtime: string }[] };
+    renderFmBreadcrumb(data.path);
+    if (data.items.length === 0) {
+      fmList.innerHTML = '<div class="fm-empty">Empty directory</div>';
+      return;
     }
-    // Nothing uploadable: let xterm handle the (text) paste.
-  },
-  true,
-);
+    fmList.innerHTML = '';
+    for (const item of data.items) {
+      const row = document.createElement('div');
+      row.className = 'fm-item';
+      const isDir = item.type === 'dir';
+
+      // Icon
+      const icon = document.createElement('span');
+      icon.className = 'fm-icon ' + (isDir ? 'dir' : 'file');
+      icon.textContent = isDir ? '\u{1F4C1}' : '\u{1F4C4}';
+
+      // Name
+      const nameEl = document.createElement('span');
+      nameEl.className = 'fm-name' + (isDir ? ' dir' : '');
+      nameEl.textContent = item.name;
+
+      // Meta (size + date)
+      const meta = document.createElement('span');
+      meta.className = 'fm-meta';
+      if (isDir) {
+        meta.textContent = '';
+      } else {
+        meta.textContent = fmtSize(item.size);
+      }
+
+      // Actions (visible on hover)
+      const actions = document.createElement('span');
+      actions.className = 'fm-actions';
+
+      // Download btn (files only)
+      if (!isDir) {
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'icon-btn sm';
+        dlBtn.title = 'Download';
+        dlBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M10 3v10M6 9l4 4 4-4M3 14v2a1 1 0 001 1h12a1 1 0 001-1v-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        dlBtn.addEventListener('click', (e) => { e.stopPropagation(); void downloadFromHost(item.name.includes(' ') ? `'${data.path}/${item.name}'` : `${data.path}/${item.name}`); });
+        actions.appendChild(dlBtn);
+      }
+
+      // Rename btn
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'icon-btn sm';
+      renameBtn.title = 'Rename';
+      renameBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M11.5 3.5l5 5L7 18H2v-5L11.5 3.5z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      renameBtn.addEventListener('click', (e) => { e.stopPropagation(); showFmRenameModal(`${data.path}/${item.name}`, item.name); });
+      actions.appendChild(renameBtn);
+
+      // Delete btn
+      const delBtn = document.createElement('button');
+      delBtn.className = 'icon-btn sm';
+      delBtn.title = 'Delete';
+      delBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      delBtn.addEventListener('click', (e) => { e.stopPropagation(); showFmDeleteModal(`${data.path}/${item.name}`, item.name); });
+      actions.appendChild(delBtn);
+
+      row.append(icon, nameEl, meta, actions);
+
+      // Click: enter dir or preview file
+      row.addEventListener('click', () => {
+        if (isDir) {
+          void loadFmDir(`${data.path}/${item.name}`);
+        } else {
+          void showFmPreview(`${data.path}/${item.name}`, item.name);
+        }
+      });
+
+      fmList.appendChild(row);
+    }
+  } catch {
+    fmList.innerHTML = `<div class="fm-empty">Network error</div>`;
+  }
+}
+
+// --- File preview ---
+async function showFmPreview(filePath: string, fileName: string): Promise<void> {
+  fmPreviewName.textContent = fileName;
+  fmPreviewContent.textContent = 'Loading...';
+  fmPreview.classList.remove('hidden');
+  try {
+    const res = await fetch('/api/files/read?path=' + encodeURIComponent(filePath));
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      fmPreviewContent.textContent = msg;
+      return;
+    }
+    const data = await res.json() as { content: string; size: number };
+    fmPreviewContent.textContent = data.content;
+  } catch {
+    fmPreviewContent.textContent = 'Network error';
+  }
+}
+
+// Preview actions
+document.getElementById('fmPreviewClose')?.addEventListener('click', () => fmPreview.classList.add('hidden'));
+document.getElementById('fmPreviewDownload')?.addEventListener('click', () => {
+  const name = fmPreviewName.textContent;
+  if (name && fmCurrentPath) void downloadFromHost(name.includes(' ') ? `'${fmCurrentPath}/${name}'` : `${fmCurrentPath}/${name}`);
+});
+document.getElementById('fmPreviewEdit')?.addEventListener('click', () => {
+  const name = fmPreviewName.textContent;
+  if (name && activeSession) {
+    closeFm();
+    const cmd = `nano '${fmCurrentPath}/${name}'`;
+    activeSession.sendSeq(cmd + '\n');
+  }
+});
+
+// --- New file/folder modals ---
+const fmModalOverlay = document.getElementById('fmModalOverlay')!;
+const fmModalInput = document.getElementById('fmModalInput') as HTMLInputElement;
+const fmModalTitle = document.getElementById('fmModalTitle')!;
+let fmCreateType: 'file' | 'dir' = 'file';
+
+function showFmCreateModal(type: 'file' | 'dir'): void {
+  fmCreateType = type;
+  fmModalTitle.textContent = type === 'dir' ? 'New folder' : 'New file';
+  fmModalInput.value = '';
+  fmModalInput.placeholder = type === 'dir' ? 'folder-name' : 'filename.txt';
+  fmModalOverlay.classList.add('open');
+  fmModalInput.focus();
+}
+function closeFmCreateModal(): void { fmModalOverlay.classList.remove('open'); }
+
+document.getElementById('fmNewFileBtn')?.addEventListener('click', () => showFmCreateModal('file'));
+document.getElementById('fmNewDirBtn')?.addEventListener('click', () => showFmCreateModal('dir'));
+document.getElementById('fmModalCancel')?.addEventListener('click', closeFmCreateModal);
+fmModalOverlay.addEventListener('click', (e) => { if (e.target === fmModalOverlay) closeFmCreateModal(); });
+fmModalInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); createFmItem(); } if (e.key === 'Escape') closeFmCreateModal(); });
+document.getElementById('fmModalCreate')?.addEventListener('click', createFmItem);
+
+async function createFmItem(): Promise<void> {
+  const name = fmModalInput.value.trim();
+  if (!name) return;
+  closeFmCreateModal();
+  try {
+    const res = await fetch('/api/files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: `${fmCurrentPath}/${name}`, type: fmCreateType }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`create failed: ${msg}`, 3000);
+    }
+  } catch { flashStatus('create failed (network)', 2500); }
+}
+
+// --- Rename modal ---
+const fmRenameOverlay = document.getElementById('fmRenameOverlay')!;
+const fmRenameInput = document.getElementById('fmRenameInput') as HTMLInputElement;
+let fmRenameOldPath = '';
+
+function showFmRenameModal(oldPath: string, currentName: string): void {
+  fmRenameOldPath = oldPath;
+  fmRenameInput.value = currentName;
+  fmRenameOverlay.classList.add('open');
+  fmRenameInput.focus();
+  fmRenameInput.select();
+}
+function closeFmRenameModal(): void { fmRenameOverlay.classList.remove('open'); }
+
+document.getElementById('fmRenameCancel')?.addEventListener('click', closeFmRenameModal);
+fmRenameOverlay.addEventListener('click', (e) => { if (e.target === fmRenameOverlay) closeFmRenameModal(); });
+fmRenameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renameFmItem(); } if (e.key === 'Escape') closeFmRenameModal(); });
+document.getElementById('fmRenameConfirm')?.addEventListener('click', renameFmItem);
+
+async function renameFmItem(): Promise<void> {
+  const newName = fmRenameInput.value.trim();
+  if (!newName) return;
+  closeFmRenameModal();
+  const dir = fmRenameOldPath.substring(0, fmRenameOldPath.lastIndexOf('/'));
+  try {
+    const res = await fetch('/api/files', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPath: fmRenameOldPath, newPath: `${dir}/${newName}` }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`rename failed: ${msg}`, 3000);
+    }
+  } catch { flashStatus('rename failed (network)', 2500); }
+}
+
+// --- Delete modal ---
+const fmDeleteOverlay = document.getElementById('fmDeleteOverlay')!;
+const fmDeleteMsg = document.getElementById('fmDeleteMsg')!;
+let fmDeletePath = '';
+
+function showFmDeleteModal(absPath: string, name: string): void {
+  fmDeletePath = absPath;
+  fmDeleteMsg.textContent = `Are you sure you want to delete "${name}"?`;
+  fmDeleteOverlay.classList.add('open');
+}
+function closeFmDeleteModal(): void { fmDeleteOverlay.classList.remove('open'); }
+
+document.getElementById('fmDeleteCancel')?.addEventListener('click', closeFmDeleteModal);
+fmDeleteOverlay.addEventListener('click', (e) => { if (e.target === fmDeleteOverlay) closeFmDeleteModal(); });
+document.getElementById('fmDeleteConfirm')?.addEventListener('click', deleteFmItem);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && fmDeleteOverlay.classList.contains('open')) { e.preventDefault(); deleteFmItem(); }
+});
+
+async function deleteFmItem(): Promise<void> {
+  if (!fmDeletePath) return;
+  closeFmDeleteModal();
+  try {
+    const res = await fetch('/api/files', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fmDeletePath }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const text = await res.text().catch(() => '');
+      let msg = `Error ${res.status}`;
+      try { msg = JSON.parse(text).error || msg; } catch { /* non-JSON */ }
+      flashStatus(`delete failed: ${msg}`, 3000);
+    }
+  } catch { flashStatus('delete failed (network)', 2500); }
+}
+
+// --- Upload to current directory ---
+document.getElementById('fmUploadBtn')?.addEventListener('click', () => fmFileInput.click());
+fmFileInput.addEventListener('change', async () => {
+  const files = fmFileInput.files;
+  if (!files || files.length === 0) return;
+  for (const f of Array.from(files)) {
+    await uploadFile(f, f.name);
+  }
+  fmFileInput.value = '';
+  void loadFmDir(fmCurrentPath);
+});
+
+// Paste / drag-drop file handling
+window.addEventListener('paste', (e: ClipboardEvent) => {
+  const items = e.clipboardData?.items;
+  if (PASTE_DEBUG) {
+    const cd = e.clipboardData;
+    let kinds = '(no items)';
+    if (items) { const parts: string[] = []; for (let i = 0; i < items.length; i += 1) parts.push(`${items[i].kind}/${items[i].type}`); kinds = parts.length ? parts.join(',') : '(empty)'; }
+    const types = cd && cd.types ? Array.from(cd.types).join('|') : '(none)';
+    activeSession?.debugSend('paste', `types=[${types}] items=[${kinds}] files=${cd?.files?.length ?? 0}`);
+  }
+  const dt = e.clipboardData;
+  if (!dt) return;
+  const files: File[] = [];
+  if (items) { for (let i = 0; i < items.length; i += 1) { if (items[i].kind === 'file') { const f = items[i].getAsFile(); if (f) files.push(f); } } }
+  if (files.length === 0 && dt.files) { for (let i = 0; i < dt.files.length; i += 1) files.push(dt.files[i]); }
+  if (files.length > 0) { e.preventDefault(); e.stopImmediatePropagation(); for (const f of files) void uploadFile(f, f.name); return; }
+  const html = dt.getData ? dt.getData('text/html') : '';
+  if (html) {
+    const src = new DOMParser().parseFromString(html, 'text/html').querySelector('img')?.getAttribute('src') ?? '';
+    if (src.startsWith('data:image/') || src.startsWith('blob:')) {
+      e.preventDefault(); e.stopImmediatePropagation();
+      void (async () => {
+        try {
+          const blob = await fetch(src).then((r) => r.blob());
+          if (blob.type.startsWith('image/')) { const ext = (blob.type.split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png'; await uploadFile(blob, `pasted-image.${ext}`); }
+        } catch { flashStatus('paste: could not read the image', 2500); }
+      })();
+      return;
+    }
+  }
+}, true);
 
 function dragHasFile(dt: DataTransfer | null): boolean {
   if (!dt) return false;
-  for (let i = 0; i < dt.items.length; i += 1) {
-    if (dt.items[i].kind === 'file') return true;
-  }
+  for (let i = 0; i < dt.items.length; i += 1) { if (dt.items[i].kind === 'file') return true; }
   return false;
 }
-
-termArea.addEventListener('dragover', (e) => {
-  if (!dragHasFile(e.dataTransfer)) return;
+const workspaceEl = document.querySelector('.workspace') as HTMLElement;
+workspaceEl?.addEventListener('dragover', (e) => {
+  if (!dragHasFile((e as DragEvent).dataTransfer)) return;
   e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-  termArea.classList.add('dragging');
+  if ((e as DragEvent).dataTransfer) (e as DragEvent).dataTransfer!.dropEffect = 'copy';
+  workspaceEl.classList.add('dragging');
 });
-termArea.addEventListener('dragleave', () => termArea.classList.remove('dragging'));
-termArea.addEventListener('drop', (e) => {
-  termArea.classList.remove('dragging');
-  const files = e.dataTransfer?.files;
+workspaceEl?.addEventListener('dragleave', () => workspaceEl.classList.remove('dragging'));
+workspaceEl?.addEventListener('drop', (e) => {
+  workspaceEl.classList.remove('dragging');
+  const files = (e as DragEvent).dataTransfer?.files;
   if (!files || files.length === 0) return;
   e.preventDefault();
   for (const f of Array.from(files)) void uploadFile(f, f.name);
 });
 
 // ---------------------------------------------------------------------------
-// Init: restore tabs (or start one), restore prefs, activate.
+// Init
 // ---------------------------------------------------------------------------
 const urlSession = sanitizeName(params.get('session'));
-const cached = loadTabs(); // per-device cache: offline fallback + last focus
-// A sensible value from the first tick (used by closeSession / syncFromServer
-// before init resolves); init refines it once the tab list is known.
+const cached = loadTabs();
 let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
 async function init(): Promise<void> {
-  // The server's list is authoritative; fall back to the local cache, then to
-  // a single default session when both are empty.
   const server = await fetchServerTabs();
-  let initialTabs: SavedTab[] =
-    server && server.length
-      ? server
-      : cached.tabs.length
-        ? cached.tabs.slice()
-        : [{ name: defaultSessionName, displayName: defaultSessionName }];
-  if (urlSession && !initialTabs.some((t) => t.name === urlSession)) {
-    initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
+  // localStorage is source of truth for tab ORDER; server is used to discover new sessions
+  const savedNames = new Set(cached.tabs.map((t) => t.name));
+  // Build merged list: cached order first, then any server-only sessions appended
+  let initialTabs: SavedTab[];
+  if (cached.tabs.length > 0) {
+    initialTabs = cached.tabs.slice();
+    for (const t of (server ?? [])) {
+      if (!savedNames.has(t.name)) initialTabs.push(t);
+    }
+  } else if (server && server.length) {
+    initialTabs = server;
+  } else {
+    initialTabs = [{ name: defaultSessionName, displayName: defaultSessionName }];
   }
+  if (urlSession && !initialTabs.some((t) => t.name === urlSession)) initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
 
-  for (const t of initialTabs) addSession(t.name, false, t.displayName);
-
-  const activeName = urlSession ?? cached.active ?? initialTabs[0].name;
-  activateSession(sessions.find((s) => s.name === activeName) ?? sessions[0]);
+  // Create all saved tabs in order
+  for (const t of initialTabs) {
+    const td: TabData = { id: tabIdSeq++, title: t.displayName, root: { type: 'leaf', id: paneSeq++, session: null as unknown as Session }, focused: paneSeq - 1 };
+    const s = addSession(t.name, false, t.displayName);
+    const leafId = td.root.type === 'leaf' ? td.root.id : paneSeq++;
+    td.root = { type: 'leaf', id: leafId, session: s };
+    tabDataList.push(td);
+  }
+  // Activate the saved active tab or the first one
+  const activeName = cached.active || urlSession || initialTabs[0]?.name;
+  const targetSession = sessions.find((s) => s.name === activeName) || sessions[0];
+  if (targetSession) activateSession(targetSession);
+  renderPanes();
+  // Ensure fit runs again after web fonts (JetBrains Mono) finish loading,
+  // because FitAddon measures character width from a hidden element — if the
+  // font isn't loaded yet the measurement is wrong and the canvas is too small.
+  document.fonts?.ready?.then(() => fitActive());
 }
 
 void init();
 
-// Keep the tab list in sync with the server: when the page regains focus /
-// visibility, and on a light interval while visible.
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') void syncFromServer();
-});
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') void syncFromServer(); });
 window.addEventListener('focus', () => void syncFromServer());
-setInterval(() => {
-  if (document.visibilityState === 'visible') void syncFromServer();
-}, 5000);
+setInterval(() => { if (document.visibilityState === 'visible') void syncFromServer(); }, 5000);
 
-// Default: show the key bar on touch devices, hidden on desktop (unless saved).
 const keybarDefault = (() => {
-  try {
-    const v = localStorage.getItem('tw.keybar');
-    if (v !== null) return v === '1';
-  } catch {
-    /* ignore */
-  }
+  try { const v = localStorage.getItem('tw.keybar'); if (v !== null) return v === '1'; } catch { /* ignore */ }
   return window.matchMedia('(pointer: coarse)').matches;
 })();
 setKeybarVisible(keybarDefault);
 
-// First visit: show the copy/paste/image hint once.
-try {
-  if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700);
-} catch {
-  /* ignore */
+try { if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700); } catch { /* ignore */ }
+
+window.addEventListener('resize', () => {
+  updateKeybarHeight();
+  fitActive();
+  // Second pass: some layout reflows settle after the first fit
+  window.setTimeout(fitActive, 100);
+});
+mobileMQ.addEventListener('change', () => { updateKeybarHeight(); fitActive(); });
+if (typeof ResizeObserver !== 'undefined') { const areaObserver = new ResizeObserver(() => fitActive()); areaObserver.observe(paneGrid); }
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', updateKeyboardOffset);
+  window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+  if (VV_DEBUG) window.setTimeout(updateKeyboardOffset, 1500);
 }
+window.addEventListener('beforeunload', () => { for (const s of sessions) s.dispose(); });
+
+// Apply initial theme
+pushCssVars(THEMES.aurora);
+
+// Simulate reconnect -> connected on first load
+connDot.classList.add('reconnecting');
+connDot.style.background = '#f0b429';
+connLabel.textContent = 'reconnecting...';
+setTimeout(() => { connDot.classList.remove('reconnecting'); connDot.style.background = '#86efac'; connLabel.textContent = 'connected'; }, 1200);

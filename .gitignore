@@ -12,3 +12,6 @@ public/dist/
 
 # Lock files (use bun.lock)
 package-lock.json
+public/app.css
+public/app.js
+test-results/

@@ -74,6 +74,7 @@ mac_install() {
     <key>ProgramArguments</key>
     <array>
         <string>${BUN_BIN}</string>
+        <string>--no-env-file</string>
         <string>src/server.ts</string>
     </array>
     <key>WorkingDirectory</key>
@@ -166,7 +167,7 @@ Environment=HOST=${HOST_VAL}
 Environment=PORT=${PORT_VAL}
 Environment=DEFAULT_SESSION=web
 ${auth_unit}
-ExecStart=${BUN_BIN} src/server.ts
+ExecStart=${BUN_BIN} --no-env-file src/server.ts
 Restart=always
 RestartSec=10
 
