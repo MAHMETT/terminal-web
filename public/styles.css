@@ -108,7 +108,7 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
 /* ==========================================================================
    Workspace / pane grid (holds xterm.js)
    ========================================================================== */
-.workspace{ flex:1; display:flex; padding:8px; min-height:0; position:relative; }
+.workspace{ flex:1; display:flex; padding:4px; min-height:0; position:relative; }
 
 /* Search overlay */
 .search-overlay{
@@ -144,7 +144,7 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
 .pane{
   position:relative; background:var(--pane); border-radius:var(--radius);
   border:1px solid var(--border-soft); overflow:hidden; display:flex; flex-direction:column;
-  transition:border-color .15s; width:100%; height:100%; margin:3px;
+  transition:border-color .15s; flex:1; min-width:0; min-height:0; margin:1px;
 }
 .pane.focused{ border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
 .pane-head{
@@ -166,7 +166,6 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
 .xterm{ height:100%; width:100%; }
 .xterm .xterm-viewport, .xterm .xterm-screen{ width:100%; height:100%; }
 .pane .xterm{ position:absolute; inset:0; }
-.pane{ min-width:0; min-height:0; }
 
 /* Drag-and-drop overlay */
 .workspace.dragging::after{
@@ -513,6 +512,102 @@ input[type=range]{ width:110px; }
 .sf-val{ font-family:var(--font-mono); font-size:12px; color:var(--text); min-width:80px; text-align:center; }
 
 /* ==========================================================================
+   File Manager Panel
+   ========================================================================== */
+.fm-panel{
+  position:fixed; top:0; right:0;
+  width:min(420px, 100vw); height:100vh; height:100dvh;
+  background:var(--panel); border-left:1px solid var(--border);
+  z-index:100; display:flex; flex-direction:column;
+  transform:translateX(100%); transition:transform .25s cubic-bezier(.16,1,.3,1);
+  box-shadow:-4px 0 20px rgba(0,0,0,.3);
+}
+.fm-panel.open{ transform:translateX(0); }
+.fm-head{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:12px 16px; border-bottom:1px solid var(--border); flex-shrink:0;
+}
+.fm-head h2{ font-size:14px; font-weight:600; margin:0; color:var(--text); }
+.fm-head-actions{ display:flex; gap:2px; align-items:center; }
+
+/* Breadcrumb */
+.fm-breadcrumb{
+  display:flex; align-items:center; gap:2px;
+  padding:8px 16px; border-bottom:1px solid var(--border);
+  overflow-x:auto; white-space:nowrap; flex-shrink:0;
+  scrollbar-width:none; font-size:12px; font-family:var(--font-mono); color:var(--muted);
+}
+.fm-breadcrumb::-webkit-scrollbar{ display:none; }
+.fm-crumb{
+  cursor:pointer; padding:2px 6px; border-radius:var(--radius-sm);
+  color:var(--muted); transition:color .15s, background .15s; flex-shrink:0;
+}
+.fm-crumb:hover{ color:var(--text); background:rgba(255,255,255,.06); }
+.fm-crumb.active{ color:var(--text); font-weight:500; }
+.fm-sep{ color:var(--muted); opacity:.4; flex-shrink:0; padding:0 1px; }
+
+/* File list */
+.fm-list{ flex:1; overflow-y:auto; overflow-x:hidden; padding:4px 0; }
+.fm-item{
+  display:flex; align-items:center; gap:10px;
+  padding:8px 16px; cursor:pointer; transition:background .12s;
+}
+.fm-item:hover{ background:rgba(255,255,255,.04); }
+.fm-item.selected{ background:rgba(255,255,255,.06); }
+.fm-icon{ width:18px; height:18px; flex-shrink:0; text-align:center; font-size:15px; line-height:18px; }
+.fm-icon.dir{ color:#60a5fa; }
+.fm-icon.file{ color:var(--muted); }
+.fm-name{
+  flex:1; font-size:13px; font-family:var(--font-ui); color:var(--text);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.fm-name.dir{ font-weight:500; }
+.fm-meta{ font-size:11px; font-family:var(--font-mono); color:var(--dim); flex-shrink:0; }
+.fm-actions{ display:flex; gap:2px; opacity:0; transition:opacity .12s; }
+.fm-item:hover .fm-actions{ opacity:1; }
+.fm-item:hover .fm-meta{ visibility:hidden; }
+.fm-empty{ text-align:center; padding:48px 16px; color:var(--muted); font-size:13px; }
+
+/* File preview */
+.fm-preview{
+  border-top:1px solid var(--border); flex-shrink:0;
+  display:flex; flex-direction:column; max-height:50%;
+}
+.fm-preview.hidden{ display:none; }
+.fm-preview-head{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:8px 16px; border-bottom:1px solid var(--border); flex-shrink:0;
+}
+.fm-preview-name{
+  font-size:12px; font-family:var(--font-mono); color:var(--muted);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;
+}
+.fm-preview-actions{ display:flex; gap:2px; flex-shrink:0; }
+.fm-preview-content{
+  flex:1; overflow:auto; margin:0; padding:12px 16px;
+  font-size:12px; font-family:var(--font-mono); line-height:1.5;
+  color:var(--text); background:var(--pane); white-space:pre-wrap; word-break:break-all;
+}
+
+/* Danger button for delete */
+.btn-danger{
+  background:rgba(239,68,68,.15); color:#ef4444;
+  border:1px solid rgba(239,68,68,.2); border-radius:var(--radius);
+  padding:6px 16px; font-size:13px; font-weight:500; cursor:pointer;
+  transition:background .15s;
+}
+.btn-danger:hover{ background:rgba(239,68,68,.25); }
+
+/* Small icon button */
+.icon-btn.sm{ width:28px; height:28px; }
+
+.fm-delete-msg{ font-size:13px; color:var(--muted); margin:8px 0 16px; line-height:1.4; word-break:break-all; }
+
+@media (max-width: 600px){
+  .fm-panel{ width:100vw; border-left:none; }
+}
+
+/* ==========================================================================
    Responsive
    ========================================================================== */
 @media (max-width: 780px){
@@ -525,7 +620,7 @@ input[type=range]{ width:110px; }
   .icon-btn{ width:34px; height:34px; }
   .mini-btn{ width:26px; height:26px; font-size:12px; }
   .pane-body{ padding:9px 10px; font-size:12.5px; }
-  .workspace{ padding:5px; }
+  .workspace{ padding:2px; }
   .pane{ margin:2px; border-radius:8px; min-width:0; min-height:0; }
   .split-child{ min-width:0; min-height:0; }
   .pane-grid > *{ min-width:0; min-height:0; }
@@ -550,7 +645,7 @@ input[type=range]{ width:110px; }
   .workspace{
     position:fixed; top:calc(42px + env(safe-area-inset-top));
     left:0; right:0; bottom:var(--kb-offset);
-    padding:4px;
+    padding:2px;
     display:flex;
   }
   .pane-grid{ flex:1; display:flex; min-width:0; min-height:0; overflow:auto; }

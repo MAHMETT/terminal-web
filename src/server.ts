@@ -538,6 +538,238 @@ async function handleDownload(
 }
 
 // ---------------------------------------------------------------------------
+// File manager API (/api/files/*)
+// ---------------------------------------------------------------------------
+
+/** Resolve a user-supplied path to an absolute path, expanding ~ to homedir. */
+function resolveFilePath(raw: string): string {
+  let p = raw.trim();
+  if (p === "~" || p.startsWith("~/")) p = path.join(os.homedir(), p.slice(1));
+  return path.isAbsolute(p) ? path.resolve(p) : path.resolve(os.homedir(), p);
+}
+
+/** GET /api/files?path=~ — list directory contents */
+async function handleListFiles(
+  res: http.ServerResponse,
+  dirPath: string | null
+): Promise<void> {
+  const raw = dirPath ?? "~";
+  const abs = resolveFilePath(raw);
+
+  let stat: fs.Stats;
+  try {
+    stat = await fsp.stat(abs);
+  } catch {
+    sendJsonHttp(res, 404, { error: "path not found" });
+    return;
+  }
+  if (!stat.isDirectory()) {
+    sendJsonHttp(res, 400, { error: "not a directory" });
+    return;
+  }
+
+  let entries: fs.Dirent[];
+  try {
+    entries = await fsp.readdir(abs, { withFileTypes: true });
+  } catch (err) {
+    sendJsonHttp(res, 500, { error: String(err) });
+    return;
+  }
+
+  const items: {
+    name: string;
+    type: "file" | "dir" | "symlink";
+    size: number;
+    mtime: string;
+  }[] = [];
+
+  for (const entry of entries) {
+    // Skip hidden files/dirs (start with .) except . and ..
+    if (entry.name.startsWith(".")) continue;
+    const fullPath = path.join(abs, entry.name);
+    let itemStat: fs.Stats;
+    try {
+      itemStat = await fsp.stat(fullPath);
+    } catch {
+      continue; // broken symlink or permission error
+    }
+    const isSymlink = entry.isSymbolicLink() && !itemStat.isDirectory() && !itemStat.isFile();
+    items.push({
+      name: entry.name,
+      type: entry.isDirectory() ? "dir" : isSymlink ? "symlink" : "file",
+      size: itemStat.size,
+      mtime: itemStat.mtime.toISOString(),
+    });
+  }
+
+  // Sort: dirs first, then alphabetical
+  items.sort((a, b) => {
+    if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+
+  sendJsonHttp(res, 200, { path: abs, items });
+}
+
+/** GET /api/files/read?path=<file> — read file contents (text) */
+async function handleReadFile(
+  res: http.ServerResponse,
+  filePath: string | null
+): Promise<void> {
+  const raw = (filePath ?? "").trim();
+  if (!raw) {
+    sendJsonHttp(res, 400, { error: "missing ?path" });
+    return;
+  }
+  const abs = resolveFilePath(raw);
+
+  let stat: fs.Stats;
+  try {
+    stat = await fsp.stat(abs);
+  } catch {
+    sendJsonHttp(res, 404, { error: "file not found" });
+    return;
+  }
+  if (!stat.isFile()) {
+    sendJsonHttp(res, 400, { error: "not a file" });
+    return;
+  }
+  // Limit read to 2MB to avoid memory issues
+  if (stat.size > 2 * 1024 * 1024) {
+    sendJsonHttp(res, 400, { error: "file too large (>2MB)" });
+    return;
+  }
+
+  let content: string;
+  try {
+    content = await fsp.readFile(abs, "utf8");
+  } catch (err) {
+    sendJsonHttp(res, 500, { error: String(err) });
+    return;
+  }
+
+  sendJsonHttp(res, 200, { path: abs, content, size: stat.size });
+}
+
+/** POST /api/files — create file or directory {path, type:"file"|"dir"} */
+async function handleCreateFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { path?: unknown; type?: unknown };
+  if (typeof obj?.path !== "string" || !obj.path.trim()) {
+    sendJsonHttp(res, 400, { error: "missing path" });
+    return;
+  }
+  const fileType = obj.type === "dir" ? "dir" : "file";
+  const abs = resolveFilePath(obj.path);
+
+  // Check if already exists
+  try {
+    await fsp.stat(abs);
+    sendJsonHttp(res, 409, { error: "already exists" });
+    return;
+  } catch {
+    // Good — doesn't exist
+  }
+
+  try {
+    if (fileType === "dir") {
+      await fsp.mkdir(abs, { recursive: true });
+    } else {
+      // Ensure parent directory exists
+      await fsp.mkdir(path.dirname(abs), { recursive: true });
+      await fsp.writeFile(abs, "", "utf8");
+    }
+  } catch (err) {
+    sendJsonHttp(res, 500, { error: String(err) });
+    return;
+  }
+
+  sendJsonHttp(res, 201, { ok: true, path: abs });
+}
+
+/** DELETE /api/files — delete file or directory {path} */
+async function handleDeleteFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { path?: unknown };
+  if (typeof obj?.path !== "string" || !obj.path.trim()) {
+    sendJsonHttp(res, 400, { error: "missing path" });
+    return;
+  }
+  const abs = resolveFilePath(obj.path);
+
+  // Safety: don't delete home dir or root
+  const home = os.homedir();
+  if (abs === home || abs === "/" || abs === path.dirname(home)) {
+    sendJsonHttp(res, 403, { error: "cannot delete system directory" });
+    return;
+  }
+
+  try {
+    await fsp.rm(abs, { recursive: true, force: true });
+  } catch (err) {
+    sendJsonHttp(res, 500, { error: String(err) });
+    return;
+  }
+
+  sendJsonHttp(res, 200, { ok: true, path: abs });
+}
+
+/** PATCH /api/files — rename/move {oldPath, newPath} */
+async function handleRenameFile(
+  req: http.IncomingMessage,
+  res: http.ServerResponse
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = JSON.parse((await readBody(req, 4096)).toString("utf8"));
+  } catch {
+    sendJsonHttp(res, 400, { error: "invalid body" });
+    return;
+  }
+  const obj = body as { oldPath?: unknown; newPath?: unknown };
+  if (typeof obj?.oldPath !== "string" || typeof obj?.newPath !== "string") {
+    sendJsonHttp(res, 400, { error: "missing oldPath/newPath" });
+    return;
+  }
+  const absOld = resolveFilePath(obj.oldPath);
+  const absNew = resolveFilePath(obj.newPath);
+
+  try {
+    await fsp.stat(absOld);
+  } catch {
+    sendJsonHttp(res, 404, { error: "source not found" });
+    return;
+  }
+
+  try {
+    await fsp.rename(absOld, absNew);
+  } catch (err) {
+    sendJsonHttp(res, 500, { error: String(err) });
+    return;
+  }
+
+  sendJsonHttp(res, 200, { ok: true, oldPath: absOld, newPath: absNew });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
 
@@ -576,6 +808,28 @@ const server = http.createServer((req, res) => {
         requestUrl.pathname === "/api/download"
       ) {
         await handleDownload(req, res, requestUrl.searchParams.get("path"));
+        return;
+      }
+
+      // --- File manager API ---
+      if (method === "GET" && requestUrl.pathname === "/api/files") {
+        await handleListFiles(res, requestUrl.searchParams.get("path"));
+        return;
+      }
+      if (method === "GET" && requestUrl.pathname === "/api/files/read") {
+        await handleReadFile(res, requestUrl.searchParams.get("path"));
+        return;
+      }
+      if (method === "POST" && requestUrl.pathname === "/api/files") {
+        await handleCreateFile(req, res);
+        return;
+      }
+      if (method === "DELETE" && requestUrl.pathname === "/api/files") {
+        await handleDeleteFile(req, res);
+        return;
+      }
+      if (method === "PATCH" && requestUrl.pathname === "/api/files") {
+        await handleRenameFile(req, res);
         return;
       }
 

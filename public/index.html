@@ -63,6 +63,9 @@
         <button class="icon-btn" id="settingsBtn" title="Settings" aria-label="Open settings">
           <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="2.6" stroke="currentColor" stroke-width="1.4"/><path d="M10 2v2.2M10 15.8V18M18 10h-2.2M4.2 10H2M15.4 4.6l-1.5 1.5M6.1 13.9l-1.5 1.5M15.4 15.4l-1.5-1.5M6.1 6.1L4.6 4.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
         </button>
+        <button class="icon-btn" id="filesBtn" title="Files" aria-label="Open file manager">
+          <svg viewBox="0 0 20 20" fill="none"><path d="M3 5.5A1.5 1.5 0 014.5 4h3.172a1.5 1.5 0 011.06.44l.829.828a1.5 1.5 0 001.06.44H15.5A1.5 1.5 0 0117 7.2v7.3a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 14.5v-9z" stroke="currentColor" stroke-width="1.4"/></svg>
+        </button>
       </div>
     </div>
 
@@ -101,6 +104,92 @@
       </div>
       <div class="drawer-body" id="drawerBody"></div>
     </div>
+
+    <!-- File manager drawer overlay + panel -->
+    <div class="overlay" id="fmOverlay"></div>
+    <div class="fm-panel" id="fmPanel">
+      <div class="fm-head">
+        <h2>Files</h2>
+        <div class="fm-head-actions">
+          <button class="icon-btn" id="fmUploadBtn" title="Upload file" aria-label="Upload file">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M10 14V3M6 7l4-4 4 4M3 14v2a1 1 0 001 1h12a1 1 0 001-1v-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="icon-btn" id="fmNewFileBtn" title="New file" aria-label="New file">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M11 3H5.5A1.5 1.5 0 004 4.5v11A1.5 1.5 0 005.5 17h9a1.5 1.5 0 001.5-1.5V8L11 3z" stroke="currentColor" stroke-width="1.4"/><path d="M11 3v5h5" stroke="currentColor" stroke-width="1.4"/></svg>
+          </button>
+          <button class="icon-btn" id="fmNewDirBtn" title="New folder" aria-label="New folder">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M3 5.5A1.5 1.5 0 014.5 4h3.172a1.5 1.5 0 011.06.44l.829.828a1.5 1.5 0 001.06.44H15.5A1.5 1.5 0 0117 7.2v7.3a1.5 1.5 0 01-1.5 1.5h-11A1.5 1.5 0 013 14.5v-9z" stroke="currentColor" stroke-width="1.4"/><path d="M10 11v4M8 13h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+          </button>
+          <button class="icon-btn" id="fmRefreshBtn" title="Refresh" aria-label="Refresh">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M3 10a7 7 0 0113.45-2.7M17 10a7 7 0 01-13.45 2.7" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/><path d="M17 4v4h-4M3 16v-4h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="icon-btn" id="fmCloseBtn" aria-label="Close file manager">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="fm-breadcrumb" id="fmBreadcrumb"></div>
+      <div class="fm-list" id="fmList">
+        <div class="fm-empty">Loading…</div>
+      </div>
+      <!-- File preview panel -->
+      <div class="fm-preview hidden" id="fmPreview">
+        <div class="fm-preview-head">
+          <span class="fm-preview-name" id="fmPreviewName"></span>
+          <div class="fm-preview-actions">
+            <button class="icon-btn sm" id="fmPreviewDownload" title="Download" aria-label="Download">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M10 3v10M6 9l4 4 4-4M3 14v2a1 1 0 001 1h12a1 1 0 001-1v-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="icon-btn sm" id="fmPreviewEdit" title="Edit" aria-label="Edit">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M11.5 3.5l5 5L7 18H2v-5L11.5 3.5z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="icon-btn sm" id="fmPreviewClose" title="Close" aria-label="Close preview">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+            </button>
+          </div>
+        </div>
+        <pre class="fm-preview-content" id="fmPreviewContent"></pre>
+      </div>
+    </div>
+
+    <!-- File manager: new item modal -->
+    <div class="modal-overlay" id="fmModalOverlay">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="fmModalTitle">
+        <h3 id="fmModalTitle">New file</h3>
+        <input type="text" id="fmModalInput" maxlength="200" placeholder="filename.txt" />
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="fmModalCancel">Cancel</button>
+          <button class="btn btn-primary" id="fmModalCreate">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- File manager: rename modal -->
+    <div class="modal-overlay" id="fmRenameOverlay">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="fmRenameTitle">
+        <h3 id="fmRenameTitle">Rename</h3>
+        <input type="text" id="fmRenameInput" maxlength="200" />
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="fmRenameCancel">Cancel</button>
+          <button class="btn btn-primary" id="fmRenameConfirm">Rename</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- File manager: confirm delete modal -->
+    <div class="modal-overlay" id="fmDeleteOverlay">
+      <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="fmDeleteTitle">
+        <h3 id="fmDeleteTitle">Delete</h3>
+        <p class="fm-delete-msg" id="fmDeleteMsg"></p>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="fmDeleteCancel">Cancel</button>
+          <button class="btn btn-danger" id="fmDeleteConfirm">Delete</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Hidden file input for upload -->
+    <input type="file" id="fmFileInput" class="hidden" />
 
     <!-- Modal for new tab naming -->
     <div class="modal-overlay" id="modalOverlay">

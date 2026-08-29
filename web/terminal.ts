@@ -249,7 +249,7 @@ function renderTree(node: SplitTree, td: TabData): HTMLElement {
   if (node.type === 'leaf') {
     const leaf = node as SplitLeaf;
     const wrapper = document.createElement('div');
-    wrapper.style.cssText = 'flex:1;min-width:0;min-height:0;display:flex;';
+    wrapper.style.cssText = 'flex:1;min-width:0;min-height:0;display:flex;width:100%;height:100%;';
     if (!leaf.session) {
       // Create a new session for this pane
       const name = nextSessionName();
@@ -293,10 +293,14 @@ function renderPanes(): void {
   paneGrid.innerHTML = '';
   paneGrid.appendChild(renderTree(td.root, td));
   updateLayoutLabel();
-  // Double rAF: first lets browser compute layout, second ensures dimensions settled
-  requestAnimationFrame(() => requestAnimationFrame(() => fitActive()));
-  // Safety-net: re-fit after 150ms in case layout wasn't fully settled on first rAF
-  window.setTimeout(() => fitActive(), 150);
+  // Defer fit until browser has computed layout. Use both rAF (fast path)
+  // and a timeout fallback (covers slow font-load or layout shifts).
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    fitActive();
+    // Second pass: some layout-triggered reflows (e.g. font load, scroll-
+    // bar appearance) only settle after the first fit changes the terminal.
+    window.setTimeout(fitActive, 80);
+  }));
 }
 
 function updateLayoutLabel(): void {
@@ -770,13 +774,21 @@ class Session {
 
   fit(): void {
     if (this.el.classList.contains('hidden')) return;
-    try {
-      this.fitAddon.fit();
-    } catch {
-      // Not laid out yet — retry after layout
-      requestAnimationFrame(() => { try { this.fitAddon.fit(); } catch { /* give up */ } });
-    }
-    this.sendResize();
+    const tryFit = (): void => {
+      try {
+        // Guard: parent must exist and have non-zero dimensions for FitAddon.
+        const parent = this.el.parentElement;
+        if (!parent || parent.clientWidth === 0 || parent.clientHeight === 0) {
+          requestAnimationFrame(tryFit);
+          return;
+        }
+        this.fitAddon.fit();
+      } catch {
+        requestAnimationFrame(tryFit);
+      }
+      this.sendResize();
+    };
+    tryFit();
   }
 
   setFont(px: number): void { this.term.options.fontSize = px; this.fit(); }
@@ -2199,6 +2211,334 @@ async function downloadFromHost(rawPath: string): Promise<void> {
   flashStatus(`downloading ${a.download}${size ? ` (${fmtMB(size)} MB)` : ''}...`, 2500);
 }
 
+// ---------------------------------------------------------------------------
+// File Manager
+// ---------------------------------------------------------------------------
+const fmPanel = document.getElementById('fmPanel')!;
+const fmOverlay = document.getElementById('fmOverlay')!;
+const fmBreadcrumb = document.getElementById('fmBreadcrumb')!;
+const fmList = document.getElementById('fmList')!;
+const fmPreview = document.getElementById('fmPreview')!;
+const fmPreviewName = document.getElementById('fmPreviewName')!;
+const fmPreviewContent = document.getElementById('fmPreviewContent')!;
+const fmFileInput = document.getElementById('fmFileInput') as HTMLInputElement;
+let fmCurrentPath = '~';
+let fmOpen = false;
+
+function openFm(): void {
+  fmOpen = true;
+  fmPanel.classList.add('open');
+  fmOverlay.classList.add('open');
+  void loadFmDir(fmCurrentPath);
+}
+function closeFm(): void {
+  fmOpen = false;
+  fmPanel.classList.remove('open');
+  fmOverlay.classList.remove('open');
+  fmPreview.classList.add('hidden');
+  activeSession?.focus();
+}
+
+// Open/close
+document.getElementById('filesBtn')?.addEventListener('click', openFm);
+fmOverlay.addEventListener('click', closeFm);
+document.getElementById('fmCloseBtn')?.addEventListener('click', closeFm);
+
+// Refresh
+document.getElementById('fmRefreshBtn')?.addEventListener('click', () => void loadFmDir(fmCurrentPath));
+
+// Escape to close
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && fmOpen) { closeFm(); e.preventDefault(); e.stopPropagation(); }
+});
+
+// --- Breadcrumb rendering ---
+function renderFmBreadcrumb(absPath: string): void {
+  fmBreadcrumb.innerHTML = '';
+  // Show home as ~
+  const home = absPath.replace(/^\/home\/[^/]+/, '~');
+  const parts = home.split('/').filter(Boolean);
+  let accumulated = parts[0] === '~' ? '~' : '/' + parts[0];
+
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) {
+      accumulated += '/' + parts[i];
+      const sep = document.createElement('span');
+      sep.className = 'fm-sep';
+      sep.textContent = '/';
+      fmBreadcrumb.appendChild(sep);
+    }
+    const crumb = document.createElement('span');
+    crumb.className = 'fm-crumb' + (i === parts.length - 1 ? ' active' : '');
+    crumb.textContent = parts[i];
+    const targetPath = accumulated;
+    crumb.addEventListener('click', () => void loadFmDir(targetPath));
+    fmBreadcrumb.appendChild(crumb);
+  }
+}
+
+// --- File size formatting ---
+function fmtSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+
+// --- Load directory ---
+async function loadFmDir(dirPath: string): Promise<void> {
+  fmCurrentPath = dirPath;
+  fmList.innerHTML = '<div class="fm-empty">Loading...</div>';
+  fmPreview.classList.add('hidden');
+  try {
+    const res = await fetch('/api/files?path=' + encodeURIComponent(dirPath));
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'unknown' }));
+      fmList.innerHTML = `<div class="fm-empty">${err.error ?? 'Error loading directory'}</div>`;
+      return;
+    }
+    const data = await res.json() as { path: string; items: { name: string; type: string; size: number; mtime: string }[] };
+    renderFmBreadcrumb(data.path);
+    if (data.items.length === 0) {
+      fmList.innerHTML = '<div class="fm-empty">Empty directory</div>';
+      return;
+    }
+    fmList.innerHTML = '';
+    for (const item of data.items) {
+      const row = document.createElement('div');
+      row.className = 'fm-item';
+      const isDir = item.type === 'dir';
+
+      // Icon
+      const icon = document.createElement('span');
+      icon.className = 'fm-icon ' + (isDir ? 'dir' : 'file');
+      icon.textContent = isDir ? '\u{1F4C1}' : '\u{1F4C4}';
+
+      // Name
+      const nameEl = document.createElement('span');
+      nameEl.className = 'fm-name' + (isDir ? ' dir' : '');
+      nameEl.textContent = item.name;
+
+      // Meta (size + date)
+      const meta = document.createElement('span');
+      meta.className = 'fm-meta';
+      if (isDir) {
+        meta.textContent = '';
+      } else {
+        meta.textContent = fmtSize(item.size);
+      }
+
+      // Actions (visible on hover)
+      const actions = document.createElement('span');
+      actions.className = 'fm-actions';
+
+      // Download btn (files only)
+      if (!isDir) {
+        const dlBtn = document.createElement('button');
+        dlBtn.className = 'icon-btn sm';
+        dlBtn.title = 'Download';
+        dlBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M10 3v10M6 9l4 4 4-4M3 14v2a1 1 0 001 1h12a1 1 0 001-1v-2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+        dlBtn.addEventListener('click', (e) => { e.stopPropagation(); void downloadFromHost(item.name.includes(' ') ? `'${data.path}/${item.name}'` : `${data.path}/${item.name}`); });
+        actions.appendChild(dlBtn);
+      }
+
+      // Rename btn
+      const renameBtn = document.createElement('button');
+      renameBtn.className = 'icon-btn sm';
+      renameBtn.title = 'Rename';
+      renameBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M11.5 3.5l5 5L7 18H2v-5L11.5 3.5z" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      renameBtn.addEventListener('click', (e) => { e.stopPropagation(); showFmRenameModal(`${data.path}/${item.name}`, item.name); });
+      actions.appendChild(renameBtn);
+
+      // Delete btn
+      const delBtn = document.createElement('button');
+      delBtn.className = 'icon-btn sm';
+      delBtn.title = 'Delete';
+      delBtn.innerHTML = '<svg viewBox="0 0 20 20" fill="none"><path d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      delBtn.addEventListener('click', (e) => { e.stopPropagation(); showFmDeleteModal(`${data.path}/${item.name}`, item.name); });
+      actions.appendChild(delBtn);
+
+      row.append(icon, nameEl, meta, actions);
+
+      // Click: enter dir or preview file
+      row.addEventListener('click', () => {
+        if (isDir) {
+          void loadFmDir(`${data.path}/${item.name}`);
+        } else {
+          void showFmPreview(`${data.path}/${item.name}`, item.name);
+        }
+      });
+
+      fmList.appendChild(row);
+    }
+  } catch {
+    fmList.innerHTML = `<div class="fm-empty">Network error</div>`;
+  }
+}
+
+// --- File preview ---
+async function showFmPreview(filePath: string, fileName: string): Promise<void> {
+  fmPreviewName.textContent = fileName;
+  fmPreviewContent.textContent = 'Loading...';
+  fmPreview.classList.remove('hidden');
+  try {
+    const res = await fetch('/api/files/read?path=' + encodeURIComponent(filePath));
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: 'unknown' }));
+      fmPreviewContent.textContent = err.error ?? 'Cannot read file';
+      return;
+    }
+    const data = await res.json() as { content: string; size: number };
+    fmPreviewContent.textContent = data.content;
+  } catch {
+    fmPreviewContent.textContent = 'Network error';
+  }
+}
+
+// Preview actions
+document.getElementById('fmPreviewClose')?.addEventListener('click', () => fmPreview.classList.add('hidden'));
+document.getElementById('fmPreviewDownload')?.addEventListener('click', () => {
+  const name = fmPreviewName.textContent;
+  if (name && fmCurrentPath) void downloadFromHost(name.includes(' ') ? `'${fmCurrentPath}/${name}'` : `${fmCurrentPath}/${name}`);
+});
+document.getElementById('fmPreviewEdit')?.addEventListener('click', () => {
+  const name = fmPreviewName.textContent;
+  if (name && activeSession) {
+    closeFm();
+    const cmd = `nano '${fmCurrentPath}/${name}'`;
+    activeSession.sendSeq(cmd + '\n');
+  }
+});
+
+// --- New file/folder modals ---
+const fmModalOverlay = document.getElementById('fmModalOverlay')!;
+const fmModalInput = document.getElementById('fmModalInput') as HTMLInputElement;
+const fmModalTitle = document.getElementById('fmModalTitle')!;
+let fmCreateType: 'file' | 'dir' = 'file';
+
+function showFmCreateModal(type: 'file' | 'dir'): void {
+  fmCreateType = type;
+  fmModalTitle.textContent = type === 'dir' ? 'New folder' : 'New file';
+  fmModalInput.value = '';
+  fmModalInput.placeholder = type === 'dir' ? 'folder-name' : 'filename.txt';
+  fmModalOverlay.classList.add('open');
+  fmModalInput.focus();
+}
+function closeFmCreateModal(): void { fmModalOverlay.classList.remove('open'); }
+
+document.getElementById('fmNewFileBtn')?.addEventListener('click', () => showFmCreateModal('file'));
+document.getElementById('fmNewDirBtn')?.addEventListener('click', () => showFmCreateModal('dir'));
+document.getElementById('fmModalCancel')?.addEventListener('click', closeFmCreateModal);
+fmModalOverlay.addEventListener('click', (e) => { if (e.target === fmModalOverlay) closeFmCreateModal(); });
+fmModalInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); createFmItem(); } if (e.key === 'Escape') closeFmCreateModal(); });
+document.getElementById('fmModalCreate')?.addEventListener('click', createFmItem);
+
+async function createFmItem(): Promise<void> {
+  const name = fmModalInput.value.trim();
+  if (!name) return;
+  closeFmCreateModal();
+  try {
+    const res = await fetch('/api/files', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: `${fmCurrentPath}/${name}`, type: fmCreateType }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const err = await res.json().catch(() => ({ error: 'unknown' }));
+      flashStatus(`create failed: ${err.error}`, 3000);
+    }
+  } catch { flashStatus('create failed (network)', 2500); }
+}
+
+// --- Rename modal ---
+const fmRenameOverlay = document.getElementById('fmRenameOverlay')!;
+const fmRenameInput = document.getElementById('fmRenameInput') as HTMLInputElement;
+let fmRenameOldPath = '';
+
+function showFmRenameModal(oldPath: string, currentName: string): void {
+  fmRenameOldPath = oldPath;
+  fmRenameInput.value = currentName;
+  fmRenameOverlay.classList.add('open');
+  fmRenameInput.focus();
+  fmRenameInput.select();
+}
+function closeFmRenameModal(): void { fmRenameOverlay.classList.remove('open'); }
+
+document.getElementById('fmRenameCancel')?.addEventListener('click', closeFmRenameModal);
+fmRenameOverlay.addEventListener('click', (e) => { if (e.target === fmRenameOverlay) closeFmRenameModal(); });
+fmRenameInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); renameFmItem(); } if (e.key === 'Escape') closeFmRenameModal(); });
+document.getElementById('fmRenameConfirm')?.addEventListener('click', renameFmItem);
+
+async function renameFmItem(): Promise<void> {
+  const newName = fmRenameInput.value.trim();
+  if (!newName) return;
+  closeFmRenameModal();
+  const dir = fmRenameOldPath.substring(0, fmRenameOldPath.lastIndexOf('/'));
+  try {
+    const res = await fetch('/api/files', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldPath: fmRenameOldPath, newPath: `${dir}/${newName}` }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const err = await res.json().catch(() => ({ error: 'unknown' }));
+      flashStatus(`rename failed: ${err.error}`, 3000);
+    }
+  } catch { flashStatus('rename failed (network)', 2500); }
+}
+
+// --- Delete modal ---
+const fmDeleteOverlay = document.getElementById('fmDeleteOverlay')!;
+const fmDeleteMsg = document.getElementById('fmDeleteMsg')!;
+let fmDeletePath = '';
+
+function showFmDeleteModal(absPath: string, name: string): void {
+  fmDeletePath = absPath;
+  fmDeleteMsg.textContent = `Are you sure you want to delete "${name}"?`;
+  fmDeleteOverlay.classList.add('open');
+}
+function closeFmDeleteModal(): void { fmDeleteOverlay.classList.remove('open'); }
+
+document.getElementById('fmDeleteCancel')?.addEventListener('click', closeFmDeleteModal);
+fmDeleteOverlay.addEventListener('click', (e) => { if (e.target === fmDeleteOverlay) closeFmDeleteModal(); });
+document.getElementById('fmDeleteConfirm')?.addEventListener('click', deleteFmItem);
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && fmDeleteOverlay.classList.contains('open')) { e.preventDefault(); deleteFmItem(); }
+});
+
+async function deleteFmItem(): Promise<void> {
+  if (!fmDeletePath) return;
+  closeFmDeleteModal();
+  try {
+    const res = await fetch('/api/files', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: fmDeletePath }),
+    });
+    if (res.ok) {
+      void loadFmDir(fmCurrentPath);
+    } else {
+      const err = await res.json().catch(() => ({ error: 'unknown' }));
+      flashStatus(`delete failed: ${err.error}`, 3000);
+    }
+  } catch { flashStatus('delete failed (network)', 2500); }
+}
+
+// --- Upload to current directory ---
+document.getElementById('fmUploadBtn')?.addEventListener('click', () => fmFileInput.click());
+fmFileInput.addEventListener('change', async () => {
+  const files = fmFileInput.files;
+  if (!files || files.length === 0) return;
+  for (const f of Array.from(files)) {
+    await uploadFile(f, f.name);
+  }
+  fmFileInput.value = '';
+  void loadFmDir(fmCurrentPath);
+});
+
 // Paste / drag-drop file handling
 window.addEventListener('paste', (e: ClipboardEvent) => {
   const items = e.clipboardData?.items;
@@ -2291,6 +2631,10 @@ async function init(): Promise<void> {
   const targetSession = sessions.find((s) => s.name === activeName) || sessions[0];
   if (targetSession) activateSession(targetSession);
   renderPanes();
+  // Ensure fit runs again after web fonts (JetBrains Mono) finish loading,
+  // because FitAddon measures character width from a hidden element — if the
+  // font isn't loaded yet the measurement is wrong and the canvas is too small.
+  document.fonts?.ready?.then(() => fitActive());
 }
 
 void init();
@@ -2307,7 +2651,12 @@ setKeybarVisible(keybarDefault);
 
 try { if (!localStorage.getItem('tw.helpSeen')) window.setTimeout(openHelp, 700); } catch { /* ignore */ }
 
-window.addEventListener('resize', () => { updateKeybarHeight(); fitActive(); });
+window.addEventListener('resize', () => {
+  updateKeybarHeight();
+  fitActive();
+  // Second pass: some layout reflows settle after the first fit
+  window.setTimeout(fitActive, 100);
+});
 mobileMQ.addEventListener('change', () => { updateKeybarHeight(); fitActive(); });
 if (typeof ResizeObserver !== 'undefined') { const areaObserver = new ResizeObserver(() => fitActive()); areaObserver.observe(paneGrid); }
 if (window.visualViewport) {
