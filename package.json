@@ -13,6 +13,7 @@
     "lint": "oxlint src web"
   },
   "dependencies": {
+    "@xterm/addon-search": "^0.16.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

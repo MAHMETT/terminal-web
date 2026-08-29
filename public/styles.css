@@ -108,7 +108,35 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
 /* ==========================================================================
    Workspace / pane grid (holds xterm.js)
    ========================================================================== */
-.workspace{ flex:1; display:flex; padding:8px; min-height:0; }
+.workspace{ flex:1; display:flex; flex-direction:column; padding:8px; min-height:0; position:relative; }
+
+/* Search overlay */
+.search-overlay{
+  position:absolute; top:8px; left:50%; transform:translateX(-50%); z-index:10;
+  display:flex; animation:searchSlideIn .15s ease-out;
+}
+@keyframes searchSlideIn{ from{ opacity:0; transform:translateX(-50%) translateY(-6px); } to{ opacity:1; transform:translateX(-50%) translateY(0); } }
+.search-bar{
+  display:flex; align-items:center; gap:4px; background:var(--panel); border:1px solid var(--border);
+  border-radius:8px; padding:4px 6px; box-shadow:var(--shadow);
+}
+.search-input{
+  background:var(--pane-alt); border:1px solid var(--border); border-radius:5px;
+  padding:5px 8px; color:var(--text); font-size:12px; font-family:var(--font-mono);
+  width:220px; max-width:50vw; outline:none;
+}
+.search-input:focus{ border-color:var(--accent); }
+.search-count{ font-size:11px; color:var(--dim); padding:0 4px; white-space:nowrap; }
+.search-nav{
+  width:24px; height:24px; border-radius:5px; display:flex; align-items:center;
+  justify-content:center; color:var(--muted); font-size:14px;
+}
+.search-nav:hover{ background:rgba(255,255,255,.06); color:var(--text); }
+.search-close{
+  width:24px; height:24px; border-radius:5px; display:flex; align-items:center;
+  justify-content:center; color:var(--muted); font-size:14px;
+}
+.search-close:hover{ background:rgba(255,255,255,.06); color:var(--text); }
 .pane-grid{ flex:1; display:flex; min-width:0; min-height:0; }
 .pane-grid > *{ flex:1; min-width:0; min-height:0; }
 
@@ -302,13 +330,17 @@ input[type=range]{ width:110px; }
 .toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
 
 /* ==========================================================================
-   Paste / Help / Confirm overlays (used by JS)
+   Paste / Help / Confirm / Prompt overlays (used by JS)
    ========================================================================== */
-.paste-overlay{
+.paste-overlay,
+.confirm-overlay,
+.prompt-overlay{
   position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center;
   background:rgba(0,0,0,.55);
 }
-.paste-box{
+.paste-box,
+.confirm-box,
+.prompt-box{
   width:min(90vw, 560px); background:var(--panel); border:1px solid var(--border);
   border-radius:10px; padding:14px; box-shadow:var(--shadow);
 }

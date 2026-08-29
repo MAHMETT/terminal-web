@@ -3,6 +3,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { SearchAddon } from '@xterm/addon-search';
 
 // ---------------------------------------------------------------------------
 // Constants & helpers
@@ -176,9 +177,10 @@ function splitPaneId(td: TabData, paneId: number, dir: 'row' | 'col'): void {
 function closePane(td: TabData, paneId: number): void {
   if (countLeaves(td.root) <= 1) { confirmCloseSession(activeSession!); return; }
   const leaf = findLeaf(td.root, paneId);
-  if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.tabEl?.remove(); leaf.session.dispose(); }
+  if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
   td.root = removeLeaf(td.root, paneId)!;
   if (td.focused === paneId) td.focused = firstLeafId(td.root);
+  renderTabs();
   renderPanes();
 }
 
@@ -193,10 +195,11 @@ function setSingleLayout(td: TabData): void {
   collectIds(td.root);
   for (const id of killIds) {
     const leaf = findLeaf(td.root, id);
-    if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.tabEl?.remove(); leaf.session.dispose(); }
+    if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
   }
   const focusedLeaf = findLeaf(td.root, focusedId);
   td.root = { type: 'leaf', id: focusedId, session: focusedLeaf?.session ?? null };
+  renderTabs();
   renderPanes();
 }
 
@@ -220,10 +223,11 @@ function setGridLayout(td: TabData): void {
     const firstLeaf = findLeaf(td.root, ids[0]);
     if (firstLeaf) firstLeaf.session = activeSession;
     for (const [, s] of existingSessions) {
-      if (s !== activeSession) { s.kill(); sessions.splice(sessions.indexOf(s), 1); s.tabEl?.remove(); s.dispose(); }
+      if (s !== activeSession) { s.kill(); sessions.splice(sessions.indexOf(s), 1); s.dispose(); }
     }
   }
   td.focused = ids[0];
+  renderTabs();
   renderPanes();
 }
 
@@ -310,7 +314,7 @@ function pushCssVars(t: ThemeDef): void {
   r.setProperty('--dim', t.dim);
   r.setProperty('--accent', t.accent);
   r.setProperty('--accent2', t.accent2);
-  r.setProperty('--accent-soft', t.accent + '24');
+  r.setProperty('--accent-soft', t.accent + '26');
   // Update xterm theme
   XTERM_THEME.background = t.pane;
   XTERM_THEME.foreground = t.text;
@@ -529,6 +533,7 @@ class Session {
   everConnected = false;
 
   private readonly fitAddon = new FitAddon();
+  readonly searchAddon = new SearchAddon();
   private ws: WebSocket | null = null;
   private reconnectDelay = MIN_DELAY;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -554,6 +559,7 @@ class Session {
     });
     this.term.loadAddon(this.fitAddon);
     this.term.loadAddon(new WebLinksAddon());
+    this.term.loadAddon(this.searchAddon);
 
     // Build pane wrapper: .pane > .pane-head + .pane-body > xterm el
     this.paneEl = document.createElement('div');
@@ -585,7 +591,7 @@ class Session {
     this.paneHead.append(this.panePath, paneActions);
 
     this.el = document.createElement('div');
-    this.el.className = 'pane-body hidden';
+    this.el.className = 'pane-body';
 
     this.paneEl.append(this.paneHead, this.el);
     // NOTE: paneEl is NOT appended to paneGrid here; tree rendering places it
@@ -763,7 +769,6 @@ class Session {
   setFont(px: number): void { this.term.options.fontSize = px; this.fit(); }
 
   setActive(active: boolean): void {
-    this.el.classList.toggle('hidden', !active);
     this.paneEl?.classList.toggle('focused', active);
     if (active) {
       this.panePath!.textContent = `◦ zsh — ${this.displayName}`;
@@ -944,6 +949,7 @@ function reorderByPointer(e: PointerEvent): void {
   const [dragged] = sessions.splice(curIdx, 1);
   if (insertBefore === null) sessions.push(dragged);
   else sessions.splice(sessions.findIndex((s) => s.name === insertBefore), 0, dragged);
+  renderTabs();
   saveTabs();
 }
 
@@ -961,39 +967,46 @@ function onTabPointerUp(_e: PointerEvent, s: Session): void {
   }
 }
 
-function buildTab(s: Session): void {
-  const tab = document.createElement('div');
-  tab.className = 'tab';
-  tab.setAttribute('data-name', s.name);
-  tab.setAttribute('role', 'tab');
-  tab.setAttribute('aria-selected', 'false');
-  const dot = document.createElement('span');
-  dot.className = 'dot';
-  const label = document.createElement('span');
-  label.className = 'label';
-  label.textContent = s.displayName;
-  label.title = `session: ${s.name} (double-click to rename)`;
-  const close = document.createElement('span');
-  close.className = 'close';
-  close.textContent = '✕';
-  close.title = 'Close tab & kill session';
-  tab.append(dot, label, close);
-
-  tab.addEventListener('pointerdown', (e) => onTabPointerDown(e, s, tab));
-  let lastTap = 0;
-  tab.addEventListener('pointerdown', (e) => {
-    if ((e.target as HTMLElement).classList.contains('close')) return;
-    const now = performance.now();
-    if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
-    lastTap = now;
-  });
-  close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); confirmCloseSession(s); });
-
-  s.tabEl = tab;
-  s.tabLabel = label;
-  s.tabDot = dot;
-  tabsEl.insertBefore(tab, document.getElementById('addTab'));
-  updateTabDot(s);
+/** Rebuild the entire tab bar from the sessions array (data-driven, matching reference) */
+function renderTabs(): void {
+  const addBtn = document.getElementById('addTab');
+  // Remove all tab elements except the add button
+  while (tabsEl.firstChild) {
+    if (tabsEl.firstChild === addBtn) break;
+    tabsEl.removeChild(tabsEl.firstChild);
+  }
+  for (const s of sessions) {
+    const tab = document.createElement('div');
+    tab.className = 'tab' + (s === activeSession ? ' active' : '');
+    tab.setAttribute('data-name', s.name);
+    tab.setAttribute('role', 'tab');
+    tab.setAttribute('aria-selected', s === activeSession ? 'true' : 'false');
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    const label = document.createElement('span');
+    label.className = 'label';
+    label.textContent = s.displayName;
+    label.title = `session: ${s.name} (double-click to rename)`;
+    const close = document.createElement('span');
+    close.className = 'close';
+    close.textContent = '\u2715';
+    close.title = 'Close tab & kill session';
+    tab.append(dot, label, close);
+    tab.addEventListener('pointerdown', (e) => onTabPointerDown(e, s, tab));
+    let lastTap = 0;
+    tab.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).classList.contains('close')) return;
+      const now = performance.now();
+      if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
+      lastTap = now;
+    });
+    close.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); confirmCloseSession(s); });
+    s.tabEl = tab;
+    s.tabLabel = label;
+    s.tabDot = dot;
+    tabsEl.insertBefore(tab, addBtn);
+    updateTabDot(s);
+  }
   refreshMobileUI();
 }
 
@@ -1002,7 +1015,7 @@ function addSession(name: string, makeActive: boolean, displayName?: string): Se
   if (!s) {
     s = new Session(name, displayName);
     sessions.push(s);
-    buildTab(s);
+    renderTabs();
   } else if (displayName && displayName.trim() && displayName.trim() !== s.displayName) {
     setDisplayName(s, displayName.trim());
   }
@@ -1074,7 +1087,6 @@ function closeSession(s: Session): void {
   recentlyClosed.set(s.name, performance.now());
   s.kill();
   sessions.splice(idx, 1);
-  s.tabEl?.remove();
   s.dispose();
   // Remove from split-tree leaves
   for (const td of tabDataList) {
@@ -1100,6 +1112,7 @@ function closeSession(s: Session): void {
     }
   }
   if (sessions.length === 0) addSession(defaultSessionName, true);
+  renderTabs();
   refreshMobileUI();
   updateStatusBar();
   saveTabs();
@@ -1251,13 +1264,13 @@ function removeLocalSession(s: Session): void {
   const idx = sessions.indexOf(s);
   if (idx < 0) return;
   sessions.splice(idx, 1);
-  s.tabEl?.remove();
   s.dispose();
   if (activeSession === s) {
     activeSession = null;
     const next = sessions[idx] ?? sessions[idx - 1] ?? null;
     if (next) activateSession(next);
   }
+  renderTabs();
   refreshMobileUI();
 }
 
@@ -1360,10 +1373,58 @@ document.getElementById('settingsBtn')?.addEventListener('click', openDrawer);
 // Add tab button
 document.getElementById('addTab')?.addEventListener('click', openNewTabModal);
 
-// Search box (placeholder)
-document.querySelector('.search-box')?.addEventListener('click', () => {
-  showToast('Terminal search — coming soon');
-});
+// ---------------------------------------------------------------------------
+// Search (Ctrl+F or click search box)
+// ---------------------------------------------------------------------------
+let searchOverlay: HTMLDivElement | null = null;
+
+function openSearch(): void {
+  if (searchOverlay) { const inp = searchOverlay.querySelector('.search-input') as HTMLInputElement; inp.focus(); inp.select(); return; }
+  searchOverlay = document.createElement('div');
+  searchOverlay.className = 'search-overlay';
+  searchOverlay.innerHTML = `
+    <div class="search-bar">
+      <input type="text" class="search-input" placeholder="Search in terminal..." autocomplete="off" spellcheck="false" />
+      <span class="search-count" id="searchCount"></span>
+      <button class="search-nav" data-dir="prev" title="Previous (Shift+Enter)">&uarr;</button>
+      <button class="search-nav" data-dir="next" title="Next (Enter)">&darr;</button>
+      <button class="search-close" title="Close (Escape)">&times;</button>
+    </div>`;
+  document.querySelector('.workspace')?.prepend(searchOverlay);
+  const searchInput = searchOverlay.querySelector('.search-input') as HTMLInputElement;
+  const searchCount = searchOverlay.querySelector('#searchCount') as HTMLElement;
+
+  let debounceTimer: ReturnType<typeof setTimeout>;
+  const doSearch = (forward: boolean): void => {
+    const q = searchInput.value;
+    if (!q || !activeSession) { searchCount.textContent = ''; return; }
+    const addon = activeSession.searchAddon;
+    const found = forward ? addon.findNext(q) : addon.findPrevious(q);
+    searchCount.textContent = found ? '' : 'No match';
+  };
+
+  searchInput.addEventListener('input', () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => doSearch(true), 150);
+  });
+  searchInput.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); doSearch(!e.shiftKey); }
+    if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
+  });
+  searchOverlay.querySelector('.search-nav[data-dir="next"]')?.addEventListener('click', () => doSearch(true));
+  searchOverlay.querySelector('.search-nav[data-dir="prev"]')?.addEventListener('click', () => doSearch(false));
+  searchOverlay.querySelector('.search-close')?.addEventListener('click', closeSearch);
+  setTimeout(() => { searchInput.focus(); searchInput.select(); }, 0);
+}
+
+function closeSearch(): void {
+  if (searchOverlay) { searchOverlay.remove(); searchOverlay = null; }
+  activeSession?.searchAddon.clearDecorations();
+  activeSession?.focus();
+}
+
+document.querySelector('.search-box')?.addEventListener('click', openSearch);
 
 // ---------------------------------------------------------------------------
 // Settings drawer
@@ -1656,6 +1717,8 @@ document.addEventListener('keydown', (e) => {
     return;
   }
   if (tag === 'input' || tag === 'textarea') return;
+  // Ctrl+F / Cmd+F — open search
+  if ((e.ctrlKey || e.metaKey) && e.key === 'f') { e.preventDefault(); openSearch(); return; }
   const combo = comboFromEvent(e);
   for (const [action, bound] of Object.entries(keybinds)) {
     if (bound === combo) {
