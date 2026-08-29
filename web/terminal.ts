@@ -972,12 +972,8 @@ function onTabPointerUp(_e: PointerEvent, s: Session): void {
 
 /** Rebuild the entire tab bar from the sessions array (data-driven, matching reference) */
 function renderTabs(): void {
-  const addBtn = document.getElementById('addTab');
-  // Remove all tab elements except the add button
-  while (tabsEl.firstChild) {
-    if (tabsEl.firstChild === addBtn) break;
-    tabsEl.removeChild(tabsEl.firstChild);
-  }
+  // #addTab is a SIBLING of #tabs in the HTML, not a child — just clear and rebuild.
+  tabsEl.innerHTML = '';
   for (const s of sessions) {
     const tab = document.createElement('div');
     tab.className = 'tab' + (s === activeSession ? ' active' : '');
@@ -1007,7 +1003,7 @@ function renderTabs(): void {
     s.tabEl = tab;
     s.tabLabel = label;
     s.tabDot = dot;
-    tabsEl.insertBefore(tab, addBtn);
+    tabsEl.appendChild(tab);
     updateTabDot(s);
   }
   refreshMobileUI();
