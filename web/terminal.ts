@@ -243,6 +243,7 @@ function clearFocusedPane(td: TabData): void {
 // ---------------------------------------------------------------------------
 const mql = window.matchMedia('(max-width: 700px)');
 function effectiveDir(dir: string): string { return mql.matches ? 'col' : dir; }
+mql.addEventListener('change', renderPanes);
 
 function renderTree(node: SplitTree, td: TabData): HTMLElement {
   if (node.type === 'leaf') {
@@ -292,6 +293,8 @@ function renderPanes(): void {
   paneGrid.innerHTML = '';
   paneGrid.appendChild(renderTree(td.root, td));
   updateLayoutLabel();
+  // Double rAF: first lets browser compute layout, second ensures dimensions settled
+  requestAnimationFrame(() => requestAnimationFrame(() => fitActive()));
 }
 
 function updateLayoutLabel(): void {
@@ -1304,7 +1307,16 @@ async function syncFromServer(): Promise<void> {
 // ---------------------------------------------------------------------------
 // Layout helpers
 // ---------------------------------------------------------------------------
-function fitActive(): void { activeSession?.fit(); }
+function fitActive(): void {
+  const td = activeTabData();
+  if (!td) { activeSession?.fit(); return; }
+  // Fit all visible terminals in the current tab's split tree
+  const fitAll = (node: SplitTree): void => {
+    if (node.type === 'leaf') { (node as SplitLeaf).session?.fit(); }
+    else { for (const c of (node as SplitNode).children) fitAll(c); }
+  };
+  fitAll(td.root);
+}
 
 const mobileMQ = window.matchMedia('(max-width: 640px)');
 
@@ -1774,7 +1786,8 @@ function confirmNewTab(): void {
   const sanitized = sanitizeName(name) ?? name;
   const s = addSession(sanitized, true);
   // Create TabData for the new tab so renderPanes() has a split-tree to render
-  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1 };
+  const leafId = paneSeq++;
+  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: leafId, session: s }, focused: leafId };
   tabDataList.push(td);
   activeTabId = td.id;
   renderPanes();
