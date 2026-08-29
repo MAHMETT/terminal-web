@@ -295,6 +295,8 @@ function renderPanes(): void {
   updateLayoutLabel();
   // Double rAF: first lets browser compute layout, second ensures dimensions settled
   requestAnimationFrame(() => requestAnimationFrame(() => fitActive()));
+  // Safety-net: re-fit after 150ms in case layout wasn't fully settled on first rAF
+  window.setTimeout(() => fitActive(), 150);
 }
 
 function updateLayoutLabel(): void {
@@ -2259,14 +2261,35 @@ let defaultSessionName = urlSession ?? cached.tabs[0]?.name ?? 'web';
 
 async function init(): Promise<void> {
   const server = await fetchServerTabs();
-  let initialTabs: SavedTab[] = server && server.length ? server : cached.tabs.length ? cached.tabs.slice() : [{ name: defaultSessionName, displayName: defaultSessionName }];
+  // localStorage is source of truth for tab ORDER; server is used to discover new sessions
+  const savedNames = new Set(cached.tabs.map((t) => t.name));
+  // Build merged list: cached order first, then any server-only sessions appended
+  let initialTabs: SavedTab[];
+  if (cached.tabs.length > 0) {
+    initialTabs = cached.tabs.slice();
+    for (const t of (server ?? [])) {
+      if (!savedNames.has(t.name)) initialTabs.push(t);
+    }
+  } else if (server && server.length) {
+    initialTabs = server;
+  } else {
+    initialTabs = [{ name: defaultSessionName, displayName: defaultSessionName }];
+  }
   if (urlSession && !initialTabs.some((t) => t.name === urlSession)) initialTabs = [{ name: urlSession, displayName: urlSession }, ...initialTabs];
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
-  // Create initial tab with split-tree
-  const firstSession = addSession(defaultSessionName, true, initialTabs[0]?.displayName);
-  const td: TabData = { id: tabIdSeq++, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1 };
-  tabDataList.push(td);
-  activeTabId = td.id;
+
+  // Create all saved tabs in order
+  for (const t of initialTabs) {
+    const td: TabData = { id: tabIdSeq++, title: t.displayName, root: { type: 'leaf', id: paneSeq++, session: null as unknown as Session }, focused: paneSeq - 1 };
+    const s = addSession(t.name, false, t.displayName);
+    const leafId = td.root.type === 'leaf' ? td.root.id : paneSeq++;
+    td.root = { type: 'leaf', id: leafId, session: s };
+    tabDataList.push(td);
+  }
+  // Activate the saved active tab or the first one
+  const activeName = cached.active || urlSession || initialTabs[0]?.name;
+  const targetSession = sessions.find((s) => s.name === activeName) || sessions[0];
+  if (targetSession) activateSession(targetSession);
   renderPanes();
 }
 
