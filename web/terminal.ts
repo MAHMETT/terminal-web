@@ -490,7 +490,7 @@ let currentFont = (() => {
     const n = parseInt(localStorage.getItem('tw.fontSize') ?? '', 10);
     if (!Number.isNaN(n)) return Math.min(MAX_FONT, Math.max(MIN_FONT, n));
   } catch { /* ignore */ }
-  return 14;
+  return window.innerWidth < 700 ? 12 : 14;
 })();
 
 // Settings state
