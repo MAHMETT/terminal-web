@@ -367,6 +367,7 @@ interface TabData {
 }
 
 let paneSeq = 30;
+let tabIdSeq = 1;
 const tabDataList: TabData[] = [];
 let activeTabId = 1;
 
@@ -765,7 +766,12 @@ class Session {
 
   fit(): void {
     if (this.el.classList.contains('hidden')) return;
-    try { this.fitAddon.fit(); } catch { /* not laid out yet */ }
+    try {
+      this.fitAddon.fit();
+    } catch {
+      // Not laid out yet — retry after layout
+      requestAnimationFrame(() => { try { this.fitAddon.fit(); } catch { /* give up */ } });
+    }
     this.sendResize();
   }
 
@@ -1029,11 +1035,14 @@ function activateSession(s: Session): void {
   activeSession = s;
   s.setActive(true);
   // Sync activeTabId with the TabData that owns this session
-  const td = findTabDataForSession(s);
-  if (td && td.id !== activeTabId) {
-    activeTabId = td.id;
-    renderPanes();
+  let td = findTabDataForSession(s);
+  if (!td) {
+    // Session has no TabData yet — create one (happens for sessions added by syncFromServer)
+    td = { id: tabIdSeq++, title: s.displayName, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1 };
+    tabDataList.push(td);
   }
+  activeTabId = td.id;
+  renderPanes();
   for (const x of sessions) {
     x.tabEl?.classList.toggle('active', x === s);
     x.tabEl?.setAttribute('aria-selected', x === s ? 'true' : 'false');
@@ -1391,16 +1400,45 @@ function openSearch(): void {
   searchOverlay = document.createElement('div');
   searchOverlay.className = 'search-overlay';
   searchOverlay.innerHTML = `
-    <div class="search-bar">
-      <input type="text" class="search-input" placeholder="Search in terminal..." autocomplete="off" spellcheck="false" />
-      <span class="search-count" id="searchCount"></span>
-      <button class="search-nav" data-dir="prev" title="Previous (Shift+Enter)">&uarr;</button>
-      <button class="search-nav" data-dir="next" title="Next (Enter)">&darr;</button>
-      <button class="search-close" title="Close (Escape)">&times;</button>
+    <div class="search-bar" style="flex-direction:column;align-items:stretch;min-width:300px;">
+      <div style="display:flex;align-items:center;gap:4px;">
+        <input type="text" class="search-input" style="flex:1;" placeholder="Search sessions or terminal text..." autocomplete="off" spellcheck="false" />
+        <span class="search-count" id="searchCount"></span>
+        <button class="search-nav" data-dir="prev" title="Previous (Shift+Enter)">&uarr;</button>
+        <button class="search-nav" data-dir="next" title="Next (Enter)">&darr;</button>
+        <button class="search-close" title="Close (Escape)">&times;</button>
+      </div>
+      <div class="search-session-list" style="display:none;margin-top:6px;max-height:200px;overflow-y:auto;border-top:1px solid var(--border-soft);padding-top:4px;"></div>
     </div>`;
   document.querySelector('.workspace')?.prepend(searchOverlay);
   const searchInput = searchOverlay.querySelector('.search-input') as HTMLInputElement;
   const searchCount = searchOverlay.querySelector('#searchCount') as HTMLElement;
+  const sessionList = searchOverlay.querySelector('.search-session-list') as HTMLDivElement;
+
+  function renderSessionList(query: string): void {
+    if (!query.trim()) { sessionList.style.display = 'none'; sessionList.innerHTML = ''; return; }
+    const q = query.toLowerCase();
+    const matches = sessions.filter((s) => s.displayName.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
+    if (matches.length === 0) { sessionList.style.display = 'none'; sessionList.innerHTML = ''; return; }
+    sessionList.style.display = 'block';
+    sessionList.innerHTML = '';
+    for (const s of matches) {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:5px;cursor:pointer;font-size:12px;font-family:var(--font-mono);color:var(--text);';
+      row.addEventListener('mouseenter', () => { row.style.background = 'rgba(255,255,255,.06)'; });
+      row.addEventListener('mouseleave', () => { row.style.background = ''; });
+      const dot = document.createElement('span');
+      dot.style.cssText = `width:7px;height:7px;border-radius:50%;flex-shrink:0;background:${s.connected ? 'var(--accent)' : 'var(--dim)'};`;
+      const label = document.createElement('span');
+      label.textContent = s.displayName;
+      label.style.overflow = 'hidden';
+      label.style.textOverflow = 'ellipsis';
+      label.style.whiteSpace = 'nowrap';
+      row.append(dot, label);
+      row.addEventListener('click', () => { activateSession(s); closeSearch(); });
+      sessionList.appendChild(row);
+    }
+  }
 
   let debounceTimer: ReturnType<typeof setTimeout>;
   const doSearch = (forward: boolean): void => {
@@ -1413,11 +1451,21 @@ function openSearch(): void {
 
   searchInput.addEventListener('input', () => {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => doSearch(true), 150);
+    debounceTimer = setTimeout(() => {
+      renderSessionList(searchInput.value);
+      // Fall through to xterm text search if no session matches
+      const hasSessionMatch = sessionList.style.display !== 'none' && sessionList.children.length > 0;
+      if (!hasSessionMatch) doSearch(true);
+    }, 150);
   });
   searchInput.addEventListener('keydown', (e) => {
     e.stopPropagation();
-    if (e.key === 'Enter') { e.preventDefault(); doSearch(!e.shiftKey); }
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const firstRow = sessionList.querySelector('div') as HTMLElement | null;
+      if (sessionList.style.display !== 'none' && firstRow) { firstRow.click(); return; }
+      doSearch(!e.shiftKey);
+    }
     if (e.key === 'Escape') { e.preventDefault(); closeSearch(); }
   });
   searchOverlay.querySelector('.search-nav[data-dir="next"]')?.addEventListener('click', () => doSearch(true));
@@ -2187,9 +2235,9 @@ async function init(): Promise<void> {
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
   // Create initial tab with split-tree
   const firstSession = addSession(defaultSessionName, true, initialTabs[0]?.displayName);
-  const td: TabData = { id: 1, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1 };
+  const td: TabData = { id: tabIdSeq++, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1 };
   tabDataList.push(td);
-  activeTabId = 1;
+  activeTabId = td.id;
   renderPanes();
 }
 
