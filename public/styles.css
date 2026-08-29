@@ -76,40 +76,6 @@ button:focus-visible, [tabindex]:focus-visible, input:focus-visible, select:focu
 }
 .tab-add:hover{ background:rgba(255,255,255,.05); color:var(--text); }
 
-/* ---- Sub-tab bar (splits within a main tab) ---- */
-.subtab-bar{
-  display:none; align-items:center; gap:2px; padding:0 8px;
-  background:var(--panel); border-bottom:1px solid var(--border); flex-shrink:0;
-  overflow-x:auto; scrollbar-width:none;
-}
-.subtab-bar.visible{ display:flex; }
-.subtab-bar::-webkit-scrollbar{ display:none; }
-.subtab-item{
-  display:flex; align-items:center; gap:6px; padding:5px 10px;
-  border-radius:6px 6px 0 0; font-size:11.5px; color:var(--muted);
-  cursor:pointer; white-space:nowrap; position:relative; top:1px;
-  border:1px solid transparent; border-bottom:none; flex-shrink:0;
-  transition:background .15s, color .15s;
-}
-.subtab-item:hover{ color:var(--text); background:rgba(255,255,255,.03); }
-.subtab-item.active{
-  background:var(--pane); color:var(--text);
-  border-color:var(--border); border-bottom:1px solid var(--pane);
-}
-.subtab-item .subtab-label{ overflow:hidden; text-overflow:ellipsis; max-width:120px; }
-.subtab-item .subtab-close{
-  opacity:0; width:14px; height:14px; border-radius:3px; display:flex;
-  align-items:center; justify-content:center; font-size:10px; color:var(--muted);
-}
-.subtab-item:hover .subtab-close{ opacity:1; }
-.subtab-item .subtab-close:hover{ background:rgba(255,255,255,.08); color:var(--text); }
-.subtab-add{
-  width:22px; height:22px; border-radius:5px; color:var(--dim);
-  display:flex; align-items:center; justify-content:center; flex-shrink:0;
-  margin-left:2px; font-size:13px;
-}
-.subtab-add:hover{ background:rgba(255,255,255,.05); color:var(--text); }
-
 /* ==========================================================================
    Toolbar (second row below tabs)
    ========================================================================== */

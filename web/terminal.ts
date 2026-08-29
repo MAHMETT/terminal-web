@@ -167,83 +167,66 @@ const THEMES: Record<string, ThemeDef> = {
   custom:  { name: 'Custom',          bg: '#171a20', panel: '#1d212a', pane: '#12151b', paneAlt: '#0d1017', border: '#2a3140', borderSoft: '#222838', text: '#e8ebf0', muted: '#8890a0', dim: '#5c6370', accent: '#f2a65a', accent2: '#7fb2f0' },
 };
 let currentTheme = 'aurora';
-function splitPaneId(td: TabData, _paneId: number, _dir: 'row' | 'col'): void {
-  // Create a new sub-tab session instead of a visual split
-  const name = nextSessionName();
-  const s = addSession(name, false);
-  td.subSessions.push(s);
-  td.activeSubIdx = td.subSessions.length - 1;
-  renderSubTabs();
+function splitPaneId(td: TabData, paneId: number, dir: 'row' | 'col'): void {
+  const holder: { newId: number | null } = { newId: null };
+  td.root = insertSplit(td.root, paneId, dir, holder);
+  if (holder.newId) td.focused = holder.newId;
   renderPanes();
-  showToast('Split added');
 }
 
-function closePane(td: TabData, _paneId: number): void {
-  if (td.subSessions.length <= 1) { confirmCloseSession(activeSession!); return; }
-  const s = td.subSessions[td.activeSubIdx];
-  if (!s) return;
-  // Kill and remove the sub-tab session
-  recentlyClosed.set(s.name, performance.now());
-  s.kill();
-  sessions.splice(sessions.indexOf(s), 1);
-  s.dispose();
-  td.subSessions.splice(td.activeSubIdx, 1);
-  // Adjust active index
-  if (td.activeSubIdx >= td.subSessions.length) td.activeSubIdx = td.subSessions.length - 1;
-  // Update root leaf
-  const newFocused = td.subSessions[td.activeSubIdx];
-  td.root = { type: 'leaf', id: paneSeq++, session: newFocused };
-  td.focused = (td.root as SplitLeaf).id;
-  if (newFocused) activateSession(newFocused);
-  renderSubTabs();
+function closePane(td: TabData, paneId: number): void {
+  if (countLeaves(td.root) <= 1) { confirmCloseSession(activeSession!); return; }
+  const leaf = findLeaf(td.root, paneId);
+  if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
+  td.root = removeLeaf(td.root, paneId)!;
+  if (td.focused === paneId) td.focused = firstLeafId(td.root);
   renderTabs();
   renderPanes();
 }
 
 function setSingleLayout(td: TabData): void {
-  // Kill all sub-tabs except the active one
-  const keep = td.subSessions[td.activeSubIdx];
-  for (let i = td.subSessions.length - 1; i >= 0; i--) {
-    const s = td.subSessions[i];
-    if (s !== keep) {
-      recentlyClosed.set(s.name, performance.now());
-      s.kill();
-      sessions.splice(sessions.indexOf(s), 1);
-      s.dispose();
-    }
+  // Kill all sessions except focused
+  const focusedId = td.focused;
+  const killIds: number[] = [];
+  const collectIds = (node: SplitTree): void => {
+    if (node.type === 'leaf') { if ((node as SplitLeaf).id !== focusedId) killIds.push((node as SplitLeaf).id); }
+    else { for (const c of (node as SplitNode).children) collectIds(c); }
+  };
+  collectIds(td.root);
+  for (const id of killIds) {
+    const leaf = findLeaf(td.root, id);
+    if (leaf?.session) { leaf.session.kill(); sessions.splice(sessions.indexOf(leaf.session), 1); leaf.session.dispose(); }
   }
-  td.subSessions = keep ? [keep] : [];
-  td.activeSubIdx = 0;
-  if (keep) {
-    td.root = { type: 'leaf', id: paneSeq++, session: keep };
-    td.focused = (td.root as SplitLeaf).id;
-  }
-  renderSubTabs();
+  const focusedLeaf = findLeaf(td.root, focusedId);
+  td.root = { type: 'leaf', id: focusedId, session: focusedLeaf?.session ?? null };
   renderTabs();
   renderPanes();
 }
 
 function setGridLayout(td: TabData): void {
-  // Kill existing sub-tabs except active
-  const keep = td.subSessions[td.activeSubIdx];
-  for (let i = td.subSessions.length - 1; i >= 0; i--) {
-    const s = td.subSessions[i];
-    if (s !== keep) { recentlyClosed.set(s.name, performance.now()); s.kill(); sessions.splice(sessions.indexOf(s), 1); s.dispose(); }
+  // Kill existing sessions (keep active)
+  const existingSessions = new Map<number, Session>();
+  const collectAll = (node: SplitTree): void => {
+    if (node.type === 'leaf') { const l = node as SplitLeaf; if (l.session) existingSessions.set(l.id, l.session); }
+    else { for (const c of (node as SplitNode).children) collectAll(c); }
+  };
+  collectAll(td.root);
+  const ids = [paneSeq++, paneSeq++, paneSeq++, paneSeq++];
+  td.root = {
+    type: 'split', dir: 'col', ratio: [0.5, 0.5], children: [
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[0], session: null }, { type: 'leaf', id: ids[1], session: null }] },
+      { type: 'split', dir: 'row', ratio: [0.5, 0.5], children: [{ type: 'leaf', id: ids[2], session: null }, { type: 'leaf', id: ids[3], session: null }] },
+    ],
+  };
+  // Reuse existing session for first pane, kill the rest
+  if (activeSession) {
+    const firstLeaf = findLeaf(td.root, ids[0]);
+    if (firstLeaf) firstLeaf.session = activeSession;
+    for (const [, s] of existingSessions) {
+      if (s !== activeSession) { s.kill(); sessions.splice(sessions.indexOf(s), 1); s.dispose(); }
+    }
   }
-  // Create 3 more sub-tabs for a total of 4
-  const newSubs: Session[] = keep ? [keep] : [];
-  for (let i = 0; i < 3; i++) {
-    const name = nextSessionName();
-    const s = addSession(name, false);
-    newSubs.push(s);
-  }
-  td.subSessions = newSubs;
-  td.activeSubIdx = 0;
-  if (keep) {
-    td.root = { type: 'leaf', id: paneSeq++, session: keep };
-    td.focused = (td.root as SplitLeaf).id;
-  }
-  renderSubTabs();
+  td.focused = ids[0];
   renderTabs();
   renderPanes();
 }
@@ -307,80 +290,18 @@ function renderTree(node: SplitTree, td: TabData): HTMLElement {
 function renderPanes(): void {
   const td = activeTabData();
   if (!td) return;
-  // Update root to show only the active sub-tab's terminal
-  const activeSub = td.subSessions[td.activeSubIdx];
-  if (activeSub) {
-    td.root = { type: 'leaf', id: paneSeq++, session: activeSub };
-    td.focused = (td.root as SplitLeaf).id;
-  }
   paneGrid.innerHTML = '';
-  if (activeSub) {
-    paneGrid.appendChild(renderTree(td.root, td));
-  }
+  paneGrid.appendChild(renderTree(td.root, td));
   updateLayoutLabel();
-  renderSubTabs();
   // Double rAF: first lets browser compute layout, second ensures dimensions settled
   requestAnimationFrame(() => requestAnimationFrame(() => fitActive()));
-}
-
-/** Render the sub-tab bar below the main tab bar */
-const subTabBar = document.getElementById('subTabBar')!;
-
-function renderSubTabs(): void {
-  const td = activeTabData();
-  if (!td || td.subSessions.length <= 1) {
-    subTabBar.classList.remove('visible');
-    subTabBar.innerHTML = '';
-    return;
-  }
-  subTabBar.classList.add('visible');
-  subTabBar.innerHTML = '';
-  td.subSessions.forEach((s, idx) => {
-    const item = document.createElement('div');
-    item.className = 'subtab-item' + (idx === td.activeSubIdx ? ' active' : '');
-    const label = document.createElement('span');
-    label.className = 'subtab-label';
-    label.textContent = s.displayName;
-    label.title = `session: ${s.name} (double-click to rename)`;
-    const close = document.createElement('span');
-    close.className = 'subtab-close';
-    close.textContent = '\u2715';
-    close.title = 'Close sub-tab';
-    item.append(label, close);
-    // Click to switch sub-tab
-    item.addEventListener('click', (e) => {
-      if ((e.target as HTMLElement).classList.contains('subtab-close')) return;
-      td.activeSubIdx = idx;
-      renderPanes();
-    });
-    // Double-click to rename
-    let lastTap = 0;
-    item.addEventListener('click', () => {
-      const now = performance.now();
-      if (now - lastTap < 350) { lastTap = 0; promptRenameSession(s); return; }
-      lastTap = now;
-    });
-    // Close sub-tab
-    close.addEventListener('click', (e) => {
-      e.stopPropagation();
-      closePane(td, (td.root as SplitLeaf).id);
-    });
-    subTabBar.appendChild(item);
-  });
-  // Add "+" button to add new sub-tab
-  const addBtn = document.createElement('div');
-  addBtn.className = 'subtab-add';
-  addBtn.textContent = '+';
-  addBtn.title = 'Add split';
-  addBtn.addEventListener('click', () => { splitPaneId(td, td.focused, 'row'); });
-  subTabBar.appendChild(addBtn);
 }
 
 function updateLayoutLabel(): void {
   const td = activeTabData();
   if (!td) return;
-  const n = td.subSessions.length;
-  layoutLabel.textContent = n <= 1 ? '1 panel' : n + ' sub-tabs';
+  const n = countLeaves(td.root);
+  layoutLabel.textContent = n === 1 ? '1 panel' : n + ' panels';
 }
 
 function pushCssVars(t: ThemeDef): void {
@@ -443,9 +364,6 @@ interface TabData {
   title: string;
   root: SplitTree;
   focused: number; // pane id
-  // Sub-tab support: each session in a tab is a "sub-tab"
-  subSessions: Session[];  // sessions belonging to this tab (sub-tabs)
-  activeSubIdx: number;    // index into subSessions for the visible one
 }
 
 let paneSeq = 30;
@@ -477,10 +395,37 @@ function hasAnySession(node: SplitTree): boolean {
   return (node as SplitNode).children.some(hasAnySession);
 }
 
+function countLeaves(node: SplitTree): number { return node.type === 'leaf' ? 1 : (node as SplitNode).children.reduce((s, c) => s + countLeaves(c), 0); }
+function firstLeafId(node: SplitTree): number { return node.type === 'leaf' ? (node as SplitLeaf).id : firstLeafId((node as SplitNode).children[0]); }
 function findLeaf(node: SplitTree, id: number): SplitLeaf | null {
   if (node.type === 'leaf') return (node as SplitLeaf).id === id ? node as SplitLeaf : null;
   for (const c of (node as SplitNode).children) { const r = findLeaf(c, id); if (r) return r; }
   return null;
+}
+function insertSplit(node: SplitTree, id: number, dir: 'row' | 'col', holder: { newId: number | null }): SplitTree {
+  if (node.type === 'leaf') {
+    if ((node as SplitLeaf).id === id) {
+      const newId = paneSeq++;
+      holder.newId = newId;
+      return { type: 'split', dir, ratio: [0.5, 0.5], children: [{ type: 'leaf', id: (node as SplitLeaf).id, session: (node as SplitLeaf).session }, { type: 'leaf', id: newId, session: null }] };
+    }
+    return node;
+  }
+  return { ...(node as SplitNode), children: (node as SplitNode).children.map((c) => insertSplit(c, id, dir, holder)) };
+}
+function removeLeaf(node: SplitTree, id: number): SplitTree | null {
+  if (node.type === 'leaf') return (node as SplitLeaf).id === id ? null : node;
+  const sn = node as SplitNode;
+  const newChildren: SplitTree[] = [];
+  const newRatio: number[] = [];
+  sn.children.forEach((c, i) => {
+    const res = removeLeaf(c, id);
+    if (res !== null) { newChildren.push(res); newRatio.push(sn.ratio[i]); }
+  });
+  if (newChildren.length === 0) return null;
+  if (newChildren.length === 1) return newChildren[0];
+  const sum = newRatio.reduce((a, b) => a + b, 0) || 1;
+  return { type: 'split', dir: sn.dir, children: newChildren, ratio: newRatio.map((r) => r / sum) };
 }
 
 function clamp(v: number, min: number, max: number): number { return Math.min(max, Math.max(min, v)); }
@@ -1093,7 +1038,7 @@ function activateSession(s: Session): void {
   let td = findTabDataForSession(s);
   if (!td) {
     // Session has no TabData yet — create one (happens for sessions added by syncFromServer)
-    td = { id: tabIdSeq++, title: s.displayName, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1, subSessions: [s], activeSubIdx: 0 };
+    td = { id: tabIdSeq++, title: s.displayName, root: { type: 'leaf', id: paneSeq++, session: s }, focused: paneSeq - 1 };
     tabDataList.push(td);
   }
   activeTabId = td.id;
@@ -1886,7 +1831,7 @@ function confirmNewTab(): void {
   const s = addSession(sanitized, true);
   // Create TabData for the new tab so renderPanes() has a split-tree to render
   const leafId = paneSeq++;
-  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: leafId, session: s }, focused: leafId, subSessions: [s], activeSubIdx: 0 };
+  const td: TabData = { id: ++paneSeq, title: sanitized, root: { type: 'leaf', id: leafId, session: s }, focused: leafId };
   tabDataList.push(td);
   activeTabId = td.id;
   renderPanes();
@@ -2290,7 +2235,7 @@ async function init(): Promise<void> {
   defaultSessionName = urlSession ?? initialTabs[0]?.name ?? 'web';
   // Create initial tab with split-tree
   const firstSession = addSession(defaultSessionName, true, initialTabs[0]?.displayName);
-  const td: TabData = { id: tabIdSeq++, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1, subSessions: [firstSession], activeSubIdx: 0 };
+  const td: TabData = { id: tabIdSeq++, title: defaultSessionName, root: { type: 'leaf', id: paneSeq++, session: firstSession }, focused: paneSeq - 1 };
   tabDataList.push(td);
   activeTabId = td.id;
   renderPanes();
