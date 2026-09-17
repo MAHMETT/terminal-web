@@ -342,7 +342,9 @@ Secondary actions must not consume permanent screen space on mobile.
 
 - Minimalist, clean, fresh, dark-first.
 - Neutral surfaces with one restrained accent color.
-- Thin borders, moderate radius, minimal shadow.
+- Thin, low-contrast borders only; no box-shadow or drop-shadow anywhere in the
+  product UI. Use surface contrast, spacing, and border color to establish
+  hierarchy. Moderate radius is allowed where it supports touch ergonomics.
 - Sans-serif UI typography and monospace terminal typography.
 - No decorative gradients or excessive cards.
 - Clear status colors with non-color text/icon equivalents.
@@ -352,8 +354,8 @@ Secondary actions must not consume permanent screen space on mobile.
 
 - Tailwind CSS 4 is the primary UI styling system.
 - Theme tokens are defined with CSS-first `@theme`.
-- Tokens cover color, spacing, radius, typography, shadow, z-index, and
-  breakpoints.
+- Tokens cover color, spacing, radius, typography, z-index, and breakpoints.
+- The design system must not define or consume visual shadow tokens.
 - Existing `styles.css` behavior is mapped to components and tokens instead of
   copied wholesale.
 - Terminal-specific CSS remains narrowly scoped for xterm, selection clipping,
