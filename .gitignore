@@ -9,3 +9,6 @@ public/dist/
 
 # Local environment overrides
 .env
+
+# Local isolated worktrees
+.worktrees/
