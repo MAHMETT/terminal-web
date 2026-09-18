@@ -145,25 +145,16 @@ RETIRED="${MIRROR_DIR}.retired"
 say "Pre-flight"
 echo "    mirror in use: ${MIRROR_DIR}"
 echo "    switching to:  ${REPO_ROOT}"
-[ -d "${REPO_ROOT}/node_modules" ] || die "${REPO_ROOT}/node_modules missing — run 'npm install' in the repo first"
-[ -f "${REPO_ROOT}/node_modules/tsx/dist/cli.mjs" ] || die "tsx not installed in the repo — run 'npm install'"
-[ -f "${REPO_ROOT}/src/server.ts" ] || die "${REPO_ROOT}/src/server.ts missing"
-[ -f "${REPO_ROOT}/public/dist/terminal.js" ] || die "client bundle missing — run 'npm run build' in the repo first"
+[ -n "$(command -v bun || true)" ] || die "bun not found — install Bun first"
+[ -f "${REPO_ROOT}/src/index.ts" ] || die "${REPO_ROOT}/src/index.ts missing"
+[ -f "${REPO_ROOT}/public/dist/terminal.js" ] || die "client bundle missing — run 'bun run build' in the repo first"
 
-# node-pty ships per-platform prebuilds; loading the native .node off an unusual
-# filesystem (a 9p-mounted Windows drive, a network share) is the one thing that
-# could plausibly break a repo-live switch. Prove it before touching systemd.
-say "Verifying node-pty can spawn from ${REPO_ROOT}"
-(cd "${REPO_ROOT}" && timeout 30 node -e "
-const pty = require('node-pty');
-const p = pty.spawn('/bin/echo', ['ok'], {name:'xterm-256color', cols:80, rows:24});
-p.onExit(({exitCode}) => process.exit(exitCode));
-setTimeout(() => { console.error('node-pty spawn timed out'); process.exit(1); }, 10000);
-") || die "node-pty could not spawn from ${REPO_ROOT} — aborting, nothing was changed"
+say "Verifying Bun runtime from ${REPO_ROOT}"
+(cd "${REPO_ROOT}" && bun --version) || die "Bun could not run from ${REPO_ROOT}"
 echo "    ok"
 
-NODE_BIN="$(command -v node)"
-[ -n "${NODE_BIN}" ] || die "node not found on PATH"
+BUN_BIN="$(command -v bun)"
+[ -n "${BUN_BIN}" ] || die "bun not found on PATH"
 
 # If the repo lives on a separate mount, systemd must wait for it. Derive the
 # mount point instead of hardcoding one, so this works for a Windows drive under
@@ -197,7 +188,7 @@ WorkingDirectory=${REPO_ROOT}
 # local disk; be explicit so a slow day does not trip the start timeout.
 TimeoutStartSec=180
 ExecStart=
-ExecStart=${NODE_BIN} ${REPO_ROOT}/node_modules/tsx/dist/cli.mjs ${REPO_ROOT}/src/server.ts
+ExecStart=${BUN_BIN} ${REPO_ROOT}/src/index.ts
 EOF
 
 say "Reloading systemd and restarting ${UNIT}"

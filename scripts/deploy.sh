@@ -148,7 +148,7 @@ fi
 # keeps the bundle in step with web/ instead of shipping a stale one.
 if [ "${DO_BUILD}" -eq 1 ]; then
   say "Building client bundle"
-  npm run build
+  bun run build
 else
   say "Skipping build (--no-build)"
   [ -f public/dist/terminal.js ] ||
@@ -172,8 +172,7 @@ case "${MODE}" in
   mirror)
     command -v rsync >/dev/null 2>&1 || die "rsync not found on PATH"
     # Excludes match scripts/wsl-install-stack.sh so the two agree on what the
-    # live copy holds. node_modules stays put (installed in place, with
-    # platform-specific node-pty prebuilds); scripts/wsl-*.sh are host-setup
+    # live copy holds. node_modules stays put (installed in place); scripts/wsl-*.sh are host-setup
     # helpers the server never runs.
     RSYNC_ARGS=(
       -a --delete
@@ -223,7 +222,7 @@ port="${port:-8090}"
 case "${host}" in "" | "0.0.0.0" | "::") host="127.0.0.1" ;; esac
 
 # A repo on a slow filesystem (e.g. a 9p-mounted Windows drive under WSL) can
-# take ~10s to load node_modules, so allow 30s before declaring failure.
+# take ~10s to load dependencies, so allow 30s before declaring failure.
 ok=0
 for _ in $(seq 1 60); do
   # Any HTTP status means the listener is up; / answers 401 without a token,

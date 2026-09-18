@@ -1,5 +1,13 @@
-import { execFile, execFileSync } from "node:child_process";
 import type { LayoutMode, LayoutOrient } from "./types.js";
+
+async function runTmuxCommand(args: string[]): Promise<{ code: number; stdout: string }> {
+  try {
+    const proc = Bun.spawn(["tmux", ...args], { stdout: "pipe", stderr: "ignore" });
+    return { code: await proc.exited, stdout: await new Response(proc.stdout).text() };
+  } catch {
+    return { code: 1, stdout: "" };
+  }
+}
 
 /**
  * Sanitize a requested tmux session name.
@@ -15,7 +23,7 @@ export function sanitizeSession(name: string | null | undefined): string {
 }
 
 /**
- * Build the argv passed to the `tmux` binary (node-pty spawns "tmux" + these).
+ * Build the argv passed to the `tmux` binary (Bun's native PTY spawns it).
  *
  * Uses `new-session -A` so it attaches to an existing session of the same name
  * or creates it if missing — the core of the resume behavior. The session is
@@ -39,23 +47,8 @@ export function tmuxArgs(session: string, confPath: string): string[] {
  * wrongly concluding every session is gone. Never throws.
  */
 export function listTmuxSessions(): Promise<string[] | null> {
-  return new Promise((resolve) => {
-    execFile(
-      "tmux",
-      ["list-sessions", "-F", "#{session_name}"],
-      (err, stdout) => {
-        if (err) {
-          resolve(null);
-          return;
-        }
-        const names = stdout
-          .split("\n")
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
-        resolve(names);
-      }
-    );
-  });
+  return runTmuxCommand(["list-sessions", "-F", "#{session_name}"]).then(({ code, stdout }) =>
+    code === 0 ? stdout.split("\n").map((l) => l.trim()).filter(Boolean) : null);
 }
 
 /**
@@ -64,12 +57,8 @@ export function listTmuxSessions(): Promise<string[] | null> {
  * Returns true if `tmux -V` succeeds, false otherwise. Never throws.
  */
 export function ensureTmuxAvailable(): boolean {
-  try {
-    execFileSync("tmux", ["-V"], { stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  const result = Bun.spawnSync(["tmux", "-V"], { stdout: "ignore", stderr: "ignore" });
+  return result.exitCode === 0;
 }
 
 /**
@@ -110,10 +99,8 @@ export interface WebTab {
  * set-option can fail with "can't find session" — retry briefly until it sticks.
  */
 export function tagWebSession(name: string, attempt = 0): void {
-  execFile("tmux", ["set-option", "-t", name, TAB_TAG, "1"], (err) => {
-    if (err && attempt < 10) {
-      setTimeout(() => tagWebSession(name, attempt + 1), 150);
-    }
+  void runTmuxCommand(["set-option", "-t", name, TAB_TAG, "1"]).then(({ code }) => {
+    if (code !== 0 && attempt < 10) setTimeout(() => tagWebSession(name, attempt + 1), 150);
   });
 }
 
@@ -122,7 +109,7 @@ export function setWebTabLabel(name: string, displayName: string): void {
   // Strip control chars (newlines/tabs) so a label can never break the
   // space-delimited parsing in listWebTabs.
   const dn = displayName.replace(/[\x00-\x1f]/g, " ").trim().slice(0, 64) || name;
-  execFile("tmux", ["set-option", "-t", name, TAB_LABEL, dn], () => {});
+  void runTmuxCommand(["set-option", "-t", name, TAB_LABEL, dn]);
 }
 
 /**
@@ -143,12 +130,8 @@ export function listWebTabs(): Promise<WebTab[] | null> {
   const fmt = [`#{${TAB_TAG}}`, "#{session_created}", "#{session_name}", `#{${TAB_LABEL}}`].join(
     " "
   );
-  return new Promise((resolve) => {
-    execFile("tmux", ["list-sessions", "-F", fmt], (err, stdout) => {
-      if (err) {
-        resolve(null);
-        return;
-      }
+  return runTmuxCommand(["list-sessions", "-F", fmt]).then(({ code, stdout }) => {
+      if (code !== 0) return null;
       const rows: { name: string; displayName: string; created: number }[] = [];
       for (const line of stdout.split("\n")) {
         if (!line) continue;
@@ -166,8 +149,7 @@ export function listWebTabs(): Promise<WebTab[] | null> {
         });
       }
       rows.sort((a, b) => a.created - b.created);
-      resolve(rows.map(({ name, displayName }) => ({ name, displayName })));
-    });
+      return rows.map(({ name, displayName }) => ({ name, displayName }));
   });
 }
 
@@ -208,9 +190,7 @@ const PANE_FMT = "#{pane_id} #{pane_active} #{window_zoomed_flag} #{pane_top} #{
 
 /** Run tmux; resolve its stdout, or null if it failed. Never throws. */
 function runTmux(args: string[]): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile("tmux", args, (err, stdout) => resolve(err ? null : stdout));
-  });
+  return runTmuxCommand(args).then(({ code, stdout }) => code === 0 ? stdout : null);
 }
 
 async function listPanes(session: string): Promise<PaneList | null> {
@@ -338,7 +318,7 @@ export async function sessionAgeSeconds(session: string): Promise<number | null>
 
 /**
  * The tty of the tmux client a pty is running, found by matching the pty's pid:
- * node-pty spawns the `tmux new-session -A` client itself, so the pid it
+ * Bun's native PTY spawns the `tmux new-session -A` client itself, so the pid it
  * reports IS the client's. Null when tmux can't be asked, or the client is gone.
  */
 export async function findClientTty(pid: number): Promise<string | null> {

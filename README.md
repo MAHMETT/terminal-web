@@ -15,8 +15,8 @@ on your laptop and keep going from your phone — it's the **same live session**
 </table>
 
 Built with [xterm.js](https://xtermjs.org/) on the front end and a small
-Node.js + TypeScript server using [`ws`](https://github.com/websockets/ws) and
-[`node-pty`](https://github.com/microsoft/node-pty) on the back end.
+Bun + TypeScript server using Elysia's native WebSocket handler and Bun's
+native `Bun.Terminal` PTY on the back end.
 
 It's designed to live on your **Tailnet**: the server binds to your Tailscale
 IP and, by default, has **no application-level auth** — anyone who can reach the
@@ -45,10 +45,10 @@ an `AUTH_TOKEN` to gate access with a shared token. See [Security](#security).
 
 ```bash
 git clone git@github.com:AaronFei/terminal-web.git && cd terminal-web
-npm install      # needs Node 18+ and tmux (on Linux also: build-essential python3)
-npm run build
+bun install      # needs Bun 1.3+ and tmux
+bun run build
 bash scripts/start.sh           # binds your Tailscale IP and prints the URL
-# no Tailscale?  HOST=192.168.1.50 PORT=8090 npm start   (or HOST=0.0.0.0)
+# no Tailscale?  HOST=192.168.1.50 PORT=8090 bun run start   (or HOST=0.0.0.0)
 ```
 
 Open the printed `http://<host>:8090/`. Want it always-on (start at boot,
@@ -67,8 +67,8 @@ for details.
                          WebSocket: /ws?session=NAME
                   binary = raw bytes, text = JSON control
   +-----------------+   <------------------------------->   +--------------------+
-  |     Browser     |                                       |   Node.js server   |
-  |   (xterm.js)    |  --- input bytes (binary frame) --->  |   ws + node-pty    |
+  |     Browser     |                                       |   Bun runtime server   |
+  |   (xterm.js)    |  --- input bytes (binary frame) --->  |   ws + Bun.Terminal PTY     |
   |  FitAddon       |  <-- output bytes (binary frame) ---  |                    |
   |  WebLinksAddon  |  --- {resize|ping} (text frame)  -->  |   spawns a pty     |
   |  WebglAddon     |  <-- {pong} (text frame)         ---  |   per connection   |
@@ -99,11 +99,10 @@ for details.
 These are CLI prerequisites — they are **not** bundled or installed by this
 project:
 
-- **Node.js 18+** (ESM, runs the server via `tsx`)
+- **Bun runtime 1.3+** (ESM, runs the server and build scripts via Bun)
 - **tmux** — the session backend (`brew install tmux` on macOS,
   `sudo apt install tmux` on Debian/Ubuntu)
-- **Linux only:** a C/C++ toolchain + Python 3 to build `node-pty`
-  (`sudo apt install -y build-essential python3`) — see [Install](#install)
+- **Linux only:** a working tmux package (`sudo apt install -y tmux`)
 - **tailscale** — **optional**. Only used to auto-detect which IP to bind to.
   Not installed? It's fine — set `HOST` yourself (see
   [Without Tailscale](#without-tailscale-lan--intranet)).
@@ -115,16 +114,11 @@ Development was done on macOS.
 ## Install
 
 ```bash
-npm install
+bun install
 ```
 
-> **Note:** `node-pty` is a native addon. It ships **prebuilt** binaries for
-> macOS and Windows, but on **Linux it compiles from source on install** — so
-> you need a C/C++ toolchain + Python 3
-> (`sudo apt install -y build-essential python3` on Debian/Ubuntu). On macOS,
-> if no prebuilt matches your Node version it also compiles, which needs the
-> Xcode Command Line Tools (`xcode-select --install`). See
-> [Troubleshooting](#troubleshooting) if install fails.
+> Bun's PTY support is built into the runtime; this project does not install
+> `node-pty` or require a native Node addon toolchain.
 
 ---
 
@@ -133,7 +127,7 @@ npm install
 Bundle the client (xterm.js + addons) with esbuild into `public/dist/`:
 
 ```bash
-npm run build
+bun run build
 ```
 
 This produces `public/dist/terminal.js` and `public/dist/terminal.css`
@@ -147,7 +141,7 @@ imports xterm's stylesheet). `public/dist/` is gitignored.
 ### Quick start (recommended)
 
 ```bash
-npm start
+bun run start
 # or, with Tailscale auto-detection and an auto-build if needed:
 bash scripts/start.sh
 ```
@@ -158,9 +152,9 @@ bash scripts/start.sh
 2. Builds the client bundle if `public/dist/terminal.js` is absent.
 3. Detects your Tailscale IPv4 (`tailscale ip -4 | head -1`) and exports it as
    `HOST` (unless `HOST` is already set).
-4. Runs `npm start` and prints the reachable `http://<host>:<port>` URL.
+4. Runs `bun run start` and prints the reachable `http://<host>:<port>` URL.
 
-`npm start` alone just runs `tsx src/server.ts`; the server itself also
+`bun run start` alone runs `bun src/index.ts`; the server itself also
 detects the Tailscale IP for `HOST` when `HOST` is unset, and logs the URLs it
 binds (highlighting the Tailscale one).
 
@@ -169,18 +163,18 @@ Then open the printed URL, e.g. `http://100.x.y.z:8090/`.
 ### Without Tailscale (LAN / intranet)
 
 Tailscale is **optional** — it's only used to auto-pick the bind address. From
-a clean clone the only hard requirements are **Node 18+** and **tmux**. Without
+a clean clone the only hard requirements are **Bun 1.3+** and **tmux**. Without
 tailscale, set `HOST` yourself:
 
 ```bash
 git clone <repo> && cd terminal-web
-npm install
-npm run build
+bun install
+bun run build
 
 # bind to a specific LAN/intranet IP...
-HOST=192.168.1.50 PORT=8090 npm start
+HOST=192.168.1.50 PORT=8090 bun run start
 # ...or bind every interface (reachable on all of the host's IPs)
-HOST=0.0.0.0 PORT=8090 npm start
+HOST=0.0.0.0 PORT=8090 bun run start
 ```
 
 `scripts/start.sh` and `scripts/service.sh install` also work without tailscale
@@ -195,11 +189,11 @@ HOST=0.0.0.0 PORT=8090 npm start
 ### Development
 
 ```bash
-npm run dev   # -> bash scripts/dev.sh
+bun run dev   # -> bash scripts/dev.sh
 ```
 
-`scripts/dev.sh` runs the esbuild watcher (`node esbuild.mjs --watch`) in the
-background and the server with reload (`tsx watch src/server.ts`) in the
+`scripts/dev.sh` runs the esbuild watcher (`bun esbuild.mjs --watch`) in the
+background and the server with reload (`bun --watch src/index.ts`) in the
 foreground. Editing `web/terminal.ts` rebuilds the bundle; editing server code
 restarts the server. The background watcher is killed automatically when you
 stop the script (Ctrl-C).
@@ -220,7 +214,7 @@ bash scripts/service.sh restart     # after changing server code
 bash scripts/service.sh uninstall   # stop and remove
 ```
 
-`install` pins the node path, the repo path, and `HOST`/`PORT` into the unit.
+`install` pins the Bun path, the repo path, and `HOST`/`PORT` into the unit.
 By default `HOST` is your Tailscale IPv4, else `0.0.0.0` (override with
 `HOST=… PORT=… bash scripts/service.sh install`). The service auto-restarts if
 it exits, with a 10 s back-off so it doesn't hot-loop while the network (or
@@ -235,7 +229,7 @@ Tailscale) is still coming up at boot.
   (`journalctl --user -u terminal-web -f`).
 
 After editing **server** code run `scripts/service.sh restart`; after editing
-**frontend** code run `npm run build` (the service serves the prebuilt bundle).
+**frontend** code run `bun run build` (the service serves the prebuilt bundle).
 
 ---
 
@@ -381,9 +375,9 @@ The `?` help overlay summarizes these (with the right keys for your OS).
 ## Environment variables
 
 All are optional. Copy `.env.example` to `.env` to override defaults. `.env` is
-loaded by `scripts/start.sh` and `scripts/dev.sh` (`npm run dev`). Running
-`npm start` (tsx) directly does **not** auto-load `.env` — export the vars in
-your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
+loaded by `scripts/start.sh` and `scripts/dev.sh` (`bun run dev`). Running
+`bun run start` directly does **not** auto-load `.env` — export the vars in
+your shell instead, e.g. `HOST=100.x.y.z PORT=8090 bun run start`.
 
 | Variable          | Default                                              | Description                                                                 |
 | ----------------- | ---------------------------------------------------- | --------------------------------------------------------------------------- |
@@ -395,6 +389,36 @@ your shell instead, e.g. `HOST=100.x.y.z PORT=8090 npm start`.
 | `UPLOAD_RETENTION_HOURS` | `72`                                          | Auto-delete uploads older than this (0 = never by age).                     |
 | `UPLOAD_MAX_FILES` | `100`                                               | Keep at most this many uploads, newest first (0 = unlimited).               |
 | `UPLOAD_MAX_MB`   | `25`                                                 | Reject any single upload larger than this many MB (0 = no limit).           |
+| `TUNNEL_PROVIDER` | `none`                                               | `none`, `reverse-proxy`, `cloudflare`, or `tailscale`.                      |
+| `TUNNEL_ENABLED`  | `false`                                              | Enables lifecycle controls and optional tunnel autostart.                   |
+| `TUNNEL_AUTOSTART`| `false`                                              | Starts the configured tunnel when the server boots.                         |
+| `TUNNEL_EXPOSE_PORT` | `PORT`                                           | Local port exposed by a tunnel provider.                                    |
+| `PUBLIC_ORIGIN`   | derived from host and port                            | Public URL used by reverse-proxy mode and UI status.                        |
+| `CONFIG_FILE`     | `./terminal-web.yaml`                                | Optional YAML file; CLI flags such as `--port=8091` override it.            |
+
+### Tunnel controls
+
+The API and mobile action sheet expose `GET /api/tunnel` plus `POST
+/api/tunnel/start`, `/stop`, and `/restart`. Set `TUNNEL_PROVIDER` to
+`cloudflare` for a quick tunnel or `tailscale` for `serve`/`funnel`. For a
+named Cloudflare tunnel, use `TUNNEL_MODE=named` and provide the tunnel name
+with `TUNNEL_HOSTNAME`; keep credentials and provider-specific routing in the
+provider's own config. `reverse-proxy` records `PUBLIC_ORIGIN` for deployments
+where TLS/ingress is managed externally.
+
+The same values can be expressed in `terminal-web.yaml`:
+
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8090
+  publicOrigin: https://terminal.example.com
+tunnel:
+  provider: reverse-proxy
+  enabled: true
+  autostart: true
+  exposePort: 8090
+```
 
 ---
 
@@ -457,11 +481,10 @@ Treat exposing this as equivalent to handing out SSH access.
 
 ## Troubleshooting
 
-**`node-pty` fails to build / `npm install` errors with node-gyp**
-`node-pty` is a native addon. Ensure you have a C/C++ toolchain:
-- macOS: `xcode-select --install`
-- Make sure your Node version matches what `node-pty` supports (Node 18+).
-- Try a clean reinstall: `rm -rf node_modules && npm install`.
+**Bun cannot start the PTY / terminal stays blank**
+This project uses Bun's built-in `Bun.Terminal` PTY. Confirm Bun is current
+(`bun --version`, 1.3+), tmux is installed (`tmux -V`), and the server process
+has permission to execute tmux.
 
 **"tmux: command not found" / sessions don't start**
 Install tmux (`brew install tmux`). The server spawns `tmux` per connection
@@ -469,7 +492,7 @@ and loads `tmux/web.tmux.conf`; without tmux on `PATH`, connections fail.
 
 **Port already in use (`EADDRINUSE`)**
 Another process holds the port. Find it with `lsof -i :8090` (adjust the port)
-and stop it, or start with a different port: `PORT=8091 npm start`.
+and stop it, or start with a different port: `PORT=8091 bun run start`.
 
 **Tailscale IP not detected / binds to `0.0.0.0`**
 Make sure Tailscale is running and connected: `tailscale status` and
@@ -482,7 +505,7 @@ server logs for the bound URL, verify you're on the tailnet, and confirm the
 port isn't blocked.
 
 **Blank page / terminal doesn't render**
-Make sure the client bundle was built: `npm run build` (or use
+Make sure the client bundle was built: `bun run build` (or use
 `scripts/start.sh`, which builds it automatically). Check the browser console
 for errors loading `/dist/terminal.js`.
 
