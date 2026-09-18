@@ -24,18 +24,16 @@ OS="$(uname -s)"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-# --- shared: resolve node/tsx/host/port/path and build if needed -------------
+# --- shared: resolve Bun/host/port/path and build if needed -----------------
 resolve_env() {
-  command -v node >/dev/null 2>&1 || die "node not found on PATH"
+  command -v bun >/dev/null 2>&1 || die "bun not found on PATH"
   command -v tmux >/dev/null 2>&1 || \
     echo "warning: tmux not found; sessions will fail until installed" >&2
 
-  NODE_BIN="$(command -v node)"
-  NODE_DIR="$(dirname "${NODE_BIN}")"
-  TSX_CLI="${REPO_ROOT}/node_modules/tsx/dist/cli.mjs"
-  [ -f "${TSX_CLI}" ] || die "tsx not installed — run 'npm install' first (${TSX_CLI} missing)"
+  BUN_BIN="$(command -v bun)"
+  BUN_DIR="$(dirname "${BUN_BIN}")"
 
-  [ -f "${REPO_ROOT}/public/dist/terminal.js" ] || (cd "${REPO_ROOT}" && npm run build)
+  [ -f "${REPO_ROOT}/public/dist/terminal.js" ] || (cd "${REPO_ROOT}" && bun run build)
 
   TS_IP=""
   if command -v tailscale >/dev/null 2>&1; then
@@ -48,8 +46,8 @@ resolve_env() {
 
   TS_DIR=""
   if command -v tailscale >/dev/null 2>&1; then TS_DIR="$(dirname "$(command -v tailscale)")"; fi
-  PATH_ENV="${NODE_DIR}"
-  [ -n "${TS_DIR}" ] && [ "${TS_DIR}" != "${NODE_DIR}" ] && PATH_ENV="${PATH_ENV}:${TS_DIR}"
+  PATH_ENV="${BUN_DIR}"
+  [ -n "${TS_DIR}" ] && [ "${TS_DIR}" != "${BUN_DIR}" ] && PATH_ENV="${PATH_ENV}:${TS_DIR}"
   PATH_ENV="${PATH_ENV}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
   mkdir -p "${REPO_ROOT}/logs"
@@ -75,9 +73,8 @@ mac_install() {
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${NODE_BIN}</string>
-        <string>${TSX_CLI}</string>
-        <string>${REPO_ROOT}/src/server.ts</string>
+        <string>${BUN_BIN}</string>
+        <string>${REPO_ROOT}/src/index.ts</string>
     </array>
     <key>WorkingDirectory</key>
     <string>${REPO_ROOT}</string>
@@ -151,16 +148,16 @@ linux_install() {
   [ -n "${AUTH_TOKEN_VAL}" ] && auth_unit="Environment=AUTH_TOKEN=${AUTH_TOKEN_VAL}"
   cat > "${UNIT_FILE}" <<UNITFILE
 [Unit]
-Description=terminal-web — web terminal (xterm.js + node-pty + tmux)
+Description=terminal-web — web terminal (Bun + Elysia + tmux)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Only kill the main node process on stop/restart, NOT the whole cgroup. The
+# Only kill the main Bun process on stop/restart, NOT the whole cgroup. The
 # tmux server (and users' running programs — e.g. Claude) is spawned as a cgroup
 # child; the systemd default KillMode=control-group would SIGTERM it on every
-# restart, wiping live sessions. KillMode=process leaves it alive so node
+# restart, wiping live sessions. KillMode=process leaves it alive so Bun
 # reconnects to the same tmux on restart — matching launchd's behaviour on macOS.
 KillMode=process
 WorkingDirectory=${REPO_ROOT}
@@ -169,7 +166,7 @@ Environment=HOST=${HOST_VAL}
 Environment=PORT=${PORT_VAL}
 Environment=DEFAULT_SESSION=web
 ${auth_unit}
-ExecStart=${NODE_BIN} ${TSX_CLI} ${REPO_ROOT}/src/server.ts
+ExecStart=${BUN_BIN} ${REPO_ROOT}/src/index.ts
 Restart=always
 RestartSec=10
 

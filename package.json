@@ -3,37 +3,42 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "A web-based terminal (xterm.js + node-pty) that runs your shell inside tmux for resumable sessions.",
+  "description": "A Bun and Elysia web terminal that runs your shell inside tmux for resumable sessions.",
   "license": "MIT",
   "author": "AaronFei",
   "engines": {
-    "node": ">=18"
+    "bun": ">=1.3"
   },
   "scripts": {
     "dev": "bash scripts/dev.sh",
-    "build": "node esbuild.mjs",
-    "start": "tsx src/server.ts",
-    "postinstall": "node scripts/fix-pty-perms.mjs"
+    "build": "bun run build:css && bun run build:js",
+    "build:css": "tailwindcss -i ./web/design-tokens.css -o ./public/dist/tailwind.css --minify",
+    "build:js": "bun esbuild.mjs",
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "test:unit": "bun test tests/unit",
+    "test:integration": "bun test tests/integration",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
-    "node-pty": "1.2.0-beta.14",
-    "ws": "^8.18.0"
+    "elysia": "^1.4.30",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "@types/bun": "^1.4.2",
     "@types/node": "^20.14.0",
-    "@types/ws": "^8.5.10",
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/addon-web-links": "^0.11.0",
     "@xterm/addon-webgl": "^0.18.0",
     "@xterm/xterm": "^5.5.0",
     "esbuild": "^0.21.5",
-    "tsx": "^4.15.0",
+    "tailwindcss": "^4.3.3",
     "typescript": "^5.4.5"
   },
   "allowScripts": {
     "esbuild@0.21.5": true,
     "esbuild@0.28.0": true,
-    "node-pty@1.2.0-beta.14": true,
     "fsevents@2.3.3": true
   }
 }

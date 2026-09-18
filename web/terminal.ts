@@ -2355,6 +2355,10 @@ sheet.append(
     closeSheet();
     promptDownload();
   }),
+  sheetRow('⌁', 'Network & tunnel', () => {
+    closeSheet();
+    void openTunnelPanel();
+  }),
   sheetRow('⤢', 'Toggle fullscreen', () => {
     closeSheet();
     toggleFullscreen();
@@ -2376,6 +2380,45 @@ function openSheet(): void {
 }
 function closeSheet(): void {
   sheetOverlay.classList.add('hidden');
+}
+
+const tunnelOverlay = document.createElement('div');
+tunnelOverlay.className = 'sheet-overlay hidden';
+const tunnelPanel = document.createElement('section');
+tunnelPanel.className = 'sheet tunnel-panel';
+const tunnelTitle = document.createElement('div');
+tunnelTitle.className = 'sheet-title';
+tunnelTitle.textContent = 'Network & tunnel';
+const tunnelStatus = document.createElement('p');
+tunnelStatus.className = 'tunnel-status';
+const tunnelActions = document.createElement('div');
+tunnelActions.className = 'tunnel-actions';
+const tunnelClose = document.createElement('button');
+tunnelClose.className = 'sheet-row';
+tunnelClose.type = 'button';
+tunnelClose.textContent = 'Close';
+tunnelClose.addEventListener('click', () => tunnelOverlay.classList.add('hidden'));
+const tunnelAction = (label: string, action: string): HTMLButtonElement => {
+  const b = document.createElement('button');
+  b.className = 'sf-btn';
+  b.type = 'button';
+  b.textContent = label;
+  b.addEventListener('click', async () => {
+    tunnelStatus.textContent = `${label}…`;
+    const response = await fetch(`/api/tunnel/${action}`, { method: 'POST' });
+    tunnelStatus.textContent = response.ok ? JSON.stringify(await response.json()) : 'Tunnel action failed';
+  });
+  return b;
+};
+tunnelActions.append(tunnelAction('Start', 'start'), tunnelAction('Stop', 'stop'), tunnelAction('Restart', 'restart'));
+tunnelPanel.append(tunnelTitle, tunnelStatus, tunnelActions, tunnelClose);
+tunnelOverlay.append(tunnelPanel);
+document.body.append(tunnelOverlay);
+tunnelOverlay.addEventListener('pointerdown', (e) => { if (e.target === tunnelOverlay) tunnelOverlay.classList.add('hidden'); });
+async function openTunnelPanel(): Promise<void> {
+  tunnelOverlay.classList.remove('hidden');
+  try { tunnelStatus.textContent = JSON.stringify(await (await fetch('/api/tunnel', { cache: 'no-store' })).json()); }
+  catch { tunnelStatus.textContent = 'Unable to read tunnel status'; }
 }
 
 // Keep the mobile bar's title + connection dot current, and re-render the open
